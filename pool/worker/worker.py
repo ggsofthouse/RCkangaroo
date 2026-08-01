@@ -268,7 +268,7 @@ def main():
     while True:
         try:
             # Request work chunk
-            work = http_post("/api/worker/get_work", {"worker_id": WORKER_ID})
+            work = http_post("/api/worker/get_work", {"worker_id": WORKER_ID, "hashrate_mhs": last_known_mhs})
             
             if not work or work.get("status") == "NO_WORK":
                 print(f"⚙️ Ativando Puzzle #{TARGET_PUZZLE} ({START_PCT}% -> {END_PCT}%) no servidor...")
@@ -365,8 +365,8 @@ def main():
                                 else:
                                     print(f"⚠️ Falso positivo descartado pelo worker: {candidate}")
 
-                    # Heartbeat every 3s
-                    if time.time() - last_heartbeat > 3:
+                    # Heartbeat every 1s
+                    if time.time() - last_heartbeat >= 1:
                         http_post("/api/worker/heartbeat", {
                             "worker_id": WORKER_ID,
                             "hashrate_mhs": last_known_mhs
@@ -374,6 +374,11 @@ def main():
                         last_heartbeat = time.time()
 
                     if proc.poll() is not None and out_q.empty():
+                        # Final heartbeat for this chunk run
+                        http_post("/api/worker/heartbeat", {
+                            "worker_id": WORKER_ID,
+                            "hashrate_mhs": last_known_mhs
+                        })
                         break
 
                     time.sleep(0.1)

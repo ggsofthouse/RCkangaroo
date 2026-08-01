@@ -235,6 +235,7 @@ class WorkerHeartbeatRequest(BaseModel):
 
 class WorkRequest(BaseModel):
     worker_id: str
+    hashrate_mhs: Optional[float] = None
 
 class SubmitSolutionRequest(BaseModel):
     worker_id: str
@@ -510,7 +511,10 @@ def get_work(req: WorkRequest):
         conn = get_db()
         cursor = conn.cursor()
 
-        cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (time.time(), req.worker_id))
+        if req.hashrate_mhs is not None and req.hashrate_mhs > 0:
+            cursor.execute("UPDATE workers SET last_ping = ?, hashrate_mhs = ? WHERE worker_id = ?", (time.time(), req.hashrate_mhs, req.worker_id))
+        else:
+            cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (time.time(), req.worker_id))
         conn.commit()
 
         cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at ASC LIMIT 1")
