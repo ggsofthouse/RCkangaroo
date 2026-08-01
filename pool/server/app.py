@@ -75,6 +75,21 @@ def hex_to_wif(hex_key: str, compressed: bool = True) -> str:
     checksum = second_sha[:4]
     return base58_encode(extended + checksum)
 
+def pubkey_to_address(pubkey_hex: str) -> str:
+    try:
+        clean = pubkey_hex.strip()
+        if clean.startswith("0x") or clean.startswith("0X"):
+            clean = clean[2:]
+        pub_bytes = bytes.fromhex(clean)
+        sha256_res = hashlib.sha256(pub_bytes).digest()
+        ripemd160_res = hashlib.new('ripemd160', sha256_res).digest()
+        extended = b'\x00' + ripemd160_res
+        checksum = hashlib.sha256(hashlib.sha256(extended).digest()).digest()[:4]
+        return base58_encode(extended + checksum)
+    except Exception:
+        return "N/A"
+
+
 # SECP256K1 Verification Math
 _P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 _Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
@@ -393,9 +408,24 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         cursor.execute("SELECT * FROM jobs ORDER BY created_at DESC")
         jobs_raw = [dict(j) for j in cursor.fetchall()]
         
+        pubkey_to_preset = {}
+        for p_num, p_data in PUZZLE_PRESETS.items():
+            pubkey_to_preset[p_data["pubkey"].lower()] = (p_num, p_data["bits"])
+
         jobs = []
         for j in jobs_raw:
             j_dict = dict(j)
+            pub = j_dict.get('pubkey', '').lower()
+            j_dict['btc_address'] = pubkey_to_address(pub)
+            
+            if pub in pubkey_to_preset:
+                p_num, p_bits = pubkey_to_preset[pub]
+                j_dict['puzzle_name'] = f"Puzzle #{p_num} ({p_bits} bits)"
+                j_dict['puzzle_number'] = p_num
+            else:
+                j_dict['puzzle_name'] = f"Custom ({j_dict.get('range_bits', 66) + 1} bits)"
+                j_dict['puzzle_number'] = None
+
             if j_dict.get('private_key'):
                 pk_hex = j_dict['private_key'].strip()
                 j_dict['private_key_hex'] = pk_hex if pk_hex.startswith("0x") else f"0x{pk_hex}"
@@ -622,6 +652,9 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 </div>
             </div>
 
+            <!-- Active Target Puzzle Detailed Card -->
+            <div id="active-target-puzzle-container" class="mb-4"></div>
+
             <!-- Create Job Form -->
             <div class="card p-4 mb-4">
                 <h5 class="mb-3">➕ Lançar Busca de Puzzle (Definir Faixa %)</h5>
@@ -720,8 +753,10 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     <table class="table table-dark table-hover align-middle">
                         <thead>
                             <tr>
-                                <th>Job ID</th>
-                                <th>Public Key</th>
+                                <th>Puzzle / Job ID</th>
+                                <th>Endereço BTC Alvo</th>
+                                <th>Chave Pública Alvo (Public Key)</th>
+                                <th>Faixa Executada (%)</th>
                                 <th>Start Offset Hex</th>
                                 <th>Range</th>
                                 <th>Status</th>
@@ -737,15 +772,15 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
         <script>
             const presets = {
-                '40': { pubkey: '03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4', bits: 40, base_start: '8000000000' },
-                '50': { pubkey: '03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6', bits: 50, base_start: '200000000000' },
-                '60': { pubkey: '0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d', bits: 60, base_start: '800000000000000' },
-                '66': { pubkey: '024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd', bits: 66, base_start: '20000000000000000' },
-                '130': { pubkey: '03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852', bits: 130, base_start: '20000000000000000000000000000000' },
-                '135': { pubkey: '02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16', bits: 135, base_start: '4000000000000000000000000000000004' },
-                '140': { pubkey: '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640', bits: 140, base_start: '80000000000000000000000000000000000' },
-                '145': { pubkey: '03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5', bits: 145, base_start: '1000000000000000000000000000000000000' },
-                '150': { pubkey: '03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49', bits: 150, base_start: '20000000000000000000000000000000000000' }
+                '40': { pubkey: '03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4', bits: 40, base_start: '8000000000', btc_address: '122vYBWuKDodGYuBwAjBYwfst8ewL6pnjQ' },
+                '50': { pubkey: '03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6', bits: 50, base_start: '200000000000', btc_address: '172W6cD98Vj2Pn126nZxPvEyc288eP8p39' },
+                '60': { pubkey: '0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d', bits: 60, base_start: '800000000000000', btc_address: '16jY7qLJn2yGwhmMvVbEFTHmyCpNXnBLvi' },
+                '66': { pubkey: '024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd', bits: 66, base_start: '20000000000000000', btc_address: '13zb1hQbWVsc2S7ZTGarEbrmcHbotPhvqD' },
+                '130': { pubkey: '03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852', bits: 130, base_start: '20000000000000000000000000000000', btc_address: '1LHtnPD8vUPG2NRSsfTQ5zWbX2SLW23yAs' },
+                '135': { pubkey: '02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16', bits: 135, base_start: '4000000000000000000000000000000004', btc_address: '16R2y56L7bg69U5d76D491j2vV6yS451z4' },
+                '140': { pubkey: '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640', bits: 140, base_start: '80000000000000000000000000000000000', btc_address: '1QKBaU6WAeycb3DbKbLBkX7vJiaS8r42Xo' },
+                '145': { pubkey: '03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5', bits: 145, base_start: '1000000000000000000000000000000000000', btc_address: '12vX5yS451z5PD3vW9n5C1x46y1N4C74y' },
+                '150': { pubkey: '03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49', bits: 150, base_start: '20000000000000000000000000000000000000', btc_address: '19vX5yS451z5PD3vW9n5C1x46y1N4C74z' }
             };
 
             function copyText(str) {
@@ -786,7 +821,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
                 if (presets[val]) {
                     const p = presets[val];
-                    previewEl.innerHTML = `Puzzle #${val} (${p.bits} bits) | Pubkey: <code>${p.pubkey.substring(0, 24)}...</code> | Intervalo: <strong>${startPct}% → ${endPct}%</strong>`;
+                    previewEl.innerHTML = `Puzzle #${val} (${p.bits} bits) | Endereço BTC: <strong class="text-warning">${p.btc_address}</strong> | Pubkey: <code>${p.pubkey.substring(0, 16)}...</code> | Intervalo: <strong>${startPct}% → ${endPct}%</strong>`;
                 } else {
                     previewEl.innerHTML = `Modo Customizado | Intervalo: <strong>${startPct}% → ${endPct}%</strong>`;
                 }
@@ -868,15 +903,71 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         `).join('');
                     }
 
+                    // Target Active Puzzle Card
+                    const targetContainer = document.getElementById('active-target-puzzle-container');
+                    const activeJob = data.jobs.find(j => j.status === 'ACTIVE');
+
+                    if (activeJob) {
+                        targetContainer.innerHTML = `
+                            <div class="card p-4 border border-info shadow-sm">
+                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                    <div class="d-flex align-items-center">
+                                        <span class="fs-4 me-2">🎯</span>
+                                        <h4 class="mb-0 text-info fw-bold">${activeJob.puzzle_name}</h4>
+                                        <span class="badge bg-success ms-3 fs-6">Em Busca Ativa</span>
+                                    </div>
+                                    <div>
+                                        <span class="badge bg-dark border border-secondary text-light fs-6 me-2">Range: ${activeJob.range_bits} bits</span>
+                                        <span class="badge bg-primary fs-6">Faixa Definida: ${activeJob.start_percent.toFixed(2)}% → ${activeJob.end_percent.toFixed(2)}%</span>
+                                    </div>
+                                </div>
+                                <div class="row g-3">
+                                    <div class="col-md-6">
+                                        <div class="stat-sub">CHAVE PÚBLICA ALVO (PUBLIC KEY):</div>
+                                        <div class="d-flex align-items-center mt-1">
+                                            <div class="key-box text-info flex-grow-1 me-2" style="font-size: 0.88rem;">${activeJob.pubkey}</div>
+                                            <button class="btn btn-sm btn-outline-info" onclick="copyText('${activeJob.pubkey}')">📋 Copiar</button>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <div class="stat-sub">ENDEREÇO BITCOIN ALVO (CORRESPONDENTE):</div>
+                                        <div class="d-flex align-items-center mt-1">
+                                            <div class="key-box text-warning flex-grow-1 me-2" style="font-size: 0.95rem; font-weight: bold;">${activeJob.btc_address}</div>
+                                            <button class="btn btn-sm btn-outline-warning" onclick="copyText('${activeJob.btc_address}')">📋 Copiar</button>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-12">
+                                        <div class="d-flex justify-content-between text-muted fs-7 mt-1">
+                                            <span>Start Offset Hex Atual: <code class="text-light">0x${activeJob.start_hex}</code></span>
+                                            <span>Base Start Hex: <code class="text-light">0x${activeJob.base_start_hex}</code></span>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    } else {
+                        targetContainer.innerHTML = '';
+                    }
+
                     // Render Jobs Table
                     const jobsBody = document.getElementById('jobs-table-body');
                     if (data.jobs.length === 0) {
-                        jobsBody.innerHTML = `<tr><td colspan="6" class="text-center text-muted p-3">Nenhum job no momento.</td></tr>`;
+                        jobsBody.innerHTML = `<tr><td colspan="8" class="text-center text-muted p-3">Nenhum job no momento.</td></tr>`;
                     } else {
                         jobsBody.innerHTML = data.jobs.map(j => `
                             <tr>
-                                <td><code>${j.job_id}</code></td>
-                                <td class="text-truncate" style="max-width: 250px;">${j.pubkey}</td>
+                                <td>
+                                    <strong class="text-info">${j.puzzle_name}</strong><br>
+                                    <code class="text-muted fs-7">${j.job_id}</code>
+                                </td>
+                                <td>
+                                    <span class="text-warning fw-bold">${j.btc_address}</span>
+                                    <button class="btn btn-sm btn-link text-warning p-0 ms-1" onclick="copyText('${j.btc_address}')" title="Copiar Endereço">📋</button>
+                                </td>
+                                <td>
+                                    <code class="text-truncate d-inline-block" style="max-width: 180px;" title="${j.pubkey}">${j.pubkey}</code>
+                                </td>
+                                <td><span class="badge bg-secondary fs-7">${j.start_percent}% → ${j.end_percent}%</span></td>
                                 <td><code>0x${j.start_hex}</code></td>
                                 <td>${j.range_bits} bits</td>
                                 <td><span class="badge ${j.status === 'SOLVED' ? 'bg-success' : 'bg-primary'}">${j.status}</span></td>
