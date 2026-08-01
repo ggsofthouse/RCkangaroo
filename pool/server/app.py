@@ -418,6 +418,12 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             pub = j_dict.get('pubkey', '').lower()
             j_dict['btc_address'] = pubkey_to_address(pub)
             
+            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE job_id = ?", (j_dict['job_id'],))
+            j_dict['total_chunks_assigned'] = cursor.fetchone()['cnt']
+            
+            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE job_id = ? AND status IN ('COMPLETED', 'SOLVED')", (j_dict['job_id'],))
+            j_dict['completed_chunks'] = cursor.fetchone()['cnt']
+            
             if pub in pubkey_to_preset:
                 p_num, p_bits = pubkey_to_preset[pub]
                 j_dict['puzzle_name'] = f"Puzzle #{p_num} ({p_bits} bits)"
@@ -593,9 +599,9 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
         <style>
             body { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
-            .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 10px; }
+            .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 12px; }
             .stat-header { font-size: 2.2rem; font-weight: bold; color: #58a6ff; }
-            .stat-sub { color: #8b949e; font-size: 0.85rem; letter-spacing: 1px; }
+            .stat-sub { color: #8b949e; font-size: 0.82rem; letter-spacing: 1px; }
             .table-dark { background-color: #161b22; color: #c9d1d9; border-color: #30363d; }
             .solved-banner {
                 background: linear-gradient(135deg, rgba(35, 134, 54, 0.25) 0%, rgba(22, 27, 34, 0.95) 100%);
@@ -611,18 +617,24 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 font-family: monospace;
                 word-break: break-all;
             }
+            @media (max-width: 768px) {
+                body { padding: 0.75rem !important; }
+                .stat-header { font-size: 1.6rem; }
+                .card { padding: 1rem !important; }
+                .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
+            }
         </style>
     </head>
     <body class="p-4">
-        <div class="container-fluid">
+        <div class="container-fluid p-2 p-md-4">
             <!-- Header -->
-            <div class="d-flex justify-content-between align-items-center mb-4 pb-2 border-bottom border-secondary">
-                <div class="d-flex align-items-center">
-                    <h2 class="mb-0 me-3">🦘 RCKangaroo Pool Coordinator</h2>
+            <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3 mb-4 pb-2 border-bottom border-secondary">
+                <div class="d-flex align-items-center flex-wrap gap-2">
+                    <h2 class="mb-0 fs-3 fw-bold">🦘 RCKangaroo Pool Coordinator</h2>
                     <span class="badge bg-success">Autenticado</span>
                 </div>
-                <div>
-                    <button class="btn btn-outline-danger btn-sm me-2" onclick="clearOldJobs()">🗑️ Limpar Todos os Jobs e Testes</button>
+                <div class="d-flex flex-wrap gap-2">
+                    <button class="btn btn-outline-danger btn-sm" onclick="clearOldJobs()">🗑️ Limpar Jobs / Testes</button>
                     <button class="btn btn-outline-primary btn-sm" onclick="loadStats()">🔄 Atualizar</button>
                 </div>
             </div>
@@ -632,19 +644,19 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
             <!-- Stats Row -->
             <div class="row g-3 mb-4">
-                <div class="col-md-4">
+                <div class="col-12 col-md-4">
                     <div class="card p-3 text-center">
                         <div class="stat-sub">HASHRATE TOTAL DA POOL</div>
                         <div class="stat-header" id="pool-hashrate">0.00 GH/s</div>
                     </div>
                 </div>
-                <div class="col-md-4">
+                <div class="col-12 col-md-4">
                     <div class="card p-3 text-center">
                         <div class="stat-sub">WORKERS ATIVOS NO MOMENTO</div>
                         <div class="stat-header text-info" id="active-workers">0</div>
                     </div>
                 </div>
-                <div class="col-md-4">
+                <div class="col-12 col-md-4">
                     <div class="card p-3 text-center">
                         <div class="stat-sub">JOBS ATIVOS</div>
                         <div class="stat-header text-warning" id="total-jobs">0</div>
@@ -655,78 +667,14 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             <!-- Active Target Puzzle Detailed Card -->
             <div id="active-target-puzzle-container" class="mb-4"></div>
 
-            <!-- Create Job Form -->
-            <div class="card p-4 mb-4">
-                <h5 class="mb-3">➕ Lançar Busca de Puzzle (Definir Faixa %)</h5>
-                
-                <form id="jobForm" class="row g-3">
-                    <div class="col-md-4">
-                        <label class="form-label text-muted">Escolha o Puzzle Oficial:</label>
-                        <select id="puzzle_select" class="form-select bg-dark text-light border-secondary" onchange="onPuzzleSelectChange()">
-                            <option value="40">Puzzle #40 (40 bits)</option>
-                            <option value="50">Puzzle #50 (50 bits)</option>
-                            <option value="60">Puzzle #60 (60 bits)</option>
-                            <option value="66" selected>Puzzle #66 (66 bits)</option>
-                            <option value="130">Puzzle #130 (130 bits)</option>
-                            <option value="135">Puzzle #135 (135 bits)</option>
-                            <option value="140">Puzzle #140 (140 bits)</option>
-                            <option value="145">Puzzle #145 (145 bits)</option>
-                            <option value="150">Puzzle #150 (150 bits)</option>
-                            <option value="custom">-- Customizado (Chave/Hex) --</option>
-                        </select>
-                    </div>
-
-                    <div class="col-md-3">
-                        <label class="form-label text-muted">Porcentagem Inicial (%):</label>
-                        <div class="input-group">
-                            <input type="number" step="0.00001" min="0" max="100" id="start_pct" class="form-control bg-dark text-light border-secondary" value="0.0" oninput="updateCalculatedHexPreview()">
-                            <span class="input-group-text bg-dark text-muted border-secondary">%</span>
-                        </div>
-                    </div>
-
-                    <div class="col-md-3">
-                        <label class="form-label text-muted">Porcentagem Final (%):</label>
-                        <div class="input-group">
-                            <input type="number" step="0.00001" min="0" max="100" id="end_pct" class="form-control bg-dark text-light border-secondary" value="100.0" oninput="updateCalculatedHexPreview()">
-                            <span class="input-group-text bg-dark text-muted border-secondary">%</span>
-                        </div>
-                    </div>
-
-                    <div class="col-md-2 d-flex align-items-end">
-                        <button type="submit" id="btn-submit-job" class="btn btn-success w-100 py-2 fw-bold">🚀 Lançar Busca</button>
-                    </div>
-
-                    <!-- Custom Fields (shown only if custom selected) -->
-                    <div id="custom-fields" class="row g-2 mt-2 d-none">
-                        <div class="col-md-6">
-                            <input type="text" id="custom_pubkey" class="form-control bg-dark text-light border-secondary" placeholder="Public Key Hex">
-                        </div>
-                        <div class="col-md-4">
-                            <input type="text" id="custom_start" class="form-control bg-dark text-light border-secondary" placeholder="Start Hex Prefix">
-                        </div>
-                        <div class="col-md-2">
-                            <input type="number" id="custom_range" class="form-control bg-dark text-light border-secondary" placeholder="Range Bits" value="66">
-                        </div>
-                    </div>
-
-                    <!-- Live Hex Calculation Preview -->
-                    <div class="col-12 mt-2">
-                        <div class="p-2 px-3 rounded bg-dark border border-secondary fs-7">
-                            <span class="text-info fw-bold">🔍 Info da Faixa:</span>
-                            <span class="ms-2 text-muted" id="preview-hex-info">Carregando...</span>
-                        </div>
-                    </div>
-                </form>
-            </div>
-
             <!-- Active Workers & Live Ranges Table -->
             <div class="card p-3 mb-4">
-                <div class="d-flex justify-content-between align-items-center mb-2">
-                    <h5 class="mb-0">💻 Workers Ativos & Faixa Atual que Cada um Começou</h5>
+                <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-2">
+                    <h5 class="mb-0 fw-bold">💻 Workers Ativos & Faixa Atual que Cada um Começou</h5>
                     <span class="badge bg-info">Desaparecem Automaticamente se Pararem</span>
                 </div>
                 <div class="table-responsive mt-2">
-                    <table class="table table-dark table-hover align-middle">
+                    <table class="table table-dark table-hover align-middle mb-0">
                         <thead>
                             <tr>
                                 <th>Worker ID / Nome</th>
@@ -918,7 +866,9 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                     </div>
                                     <div>
                                         <span class="badge bg-dark border border-secondary text-light fs-6 me-2">Range: ${activeJob.range_bits} bits</span>
-                                        <span class="badge bg-primary fs-6">Faixa Definida: ${activeJob.start_percent.toFixed(2)}% → ${activeJob.end_percent.toFixed(2)}%</span>
+                                        <span class="badge bg-primary fs-6 me-2">Faixa Definida: ${activeJob.start_percent.toFixed(2)}% → ${activeJob.end_percent.toFixed(2)}%</span>
+                                        <span class="badge bg-secondary fs-6 me-2">Chunks Atribuídos: ${activeJob.total_chunks_assigned}</span>
+                                        <span class="badge bg-success fs-6">Chunks Concluídos: ${activeJob.completed_chunks}</span>
                                     </div>
                                 </div>
                                 <div class="row g-3">
@@ -940,6 +890,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                         <div class="d-flex justify-content-between text-muted fs-7 mt-1">
                                             <span>Start Offset Hex Atual: <code class="text-light">0x${activeJob.start_hex}</code></span>
                                             <span>Base Start Hex: <code class="text-light">0x${activeJob.base_start_hex}</code></span>
+                                            <span>Tamanho de Sub-bloco (Chunk): <code class="text-info">${activeJob.chunk_bits || 66} bits</code></span>
                                         </div>
                                     </div>
                                 </div>
@@ -969,7 +920,10 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                 </td>
                                 <td><span class="badge bg-secondary fs-7">${j.start_percent}% → ${j.end_percent}%</span></td>
                                 <td><code>0x${j.start_hex}</code></td>
-                                <td>${j.range_bits} bits</td>
+                                <td>
+                                    ${j.range_bits} bits<br>
+                                    <span class="badge bg-dark border border-secondary text-info fs-7" title="Chunks Concluídos / Atribuídos">${j.completed_chunks} / ${j.total_chunks_assigned} chunks</span>
+                                </td>
                                 <td><span class="badge ${j.status === 'SOLVED' ? 'bg-success' : 'bg-primary'}">${j.status}</span></td>
                                 <td style="font-family: monospace;">
                                     ${j.status === 'SOLVED' ? `
@@ -988,47 +942,6 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 }
             }
 
-            document.getElementById('jobForm').addEventListener('submit', async (e) => {
-                e.preventDefault();
-                const btn = document.getElementById('btn-submit-job');
-                btn.disabled = true;
-                btn.innerText = 'Lançando...';
-
-                const pVal = document.getElementById('puzzle_select').value;
-                const payload = {
-                    start_percent: parseFloat(document.getElementById('start_pct').value) || 0.0,
-                    end_percent: parseFloat(document.getElementById('end_pct').value) || 100.0,
-                    dp_bits: 18,
-                    chunk_bits: 66
-                };
-
-                if (pVal !== 'custom') {
-                    payload.puzzle_number = parseInt(pVal);
-                } else {
-                    payload.pubkey = document.getElementById('custom_pubkey').value.trim();
-                    payload.start_hex = document.getElementById('custom_start').value.trim();
-                    payload.range_bits = parseInt(document.getElementById('custom_range').value) || 66;
-                }
-
-                try {
-                    const res = await fetch('/api/jobs/create', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(payload)
-                    });
-                    if (res.ok) {
-                        alert("🚀 Busca lançada com sucesso! O worker iniciará o processamento em poucos segundos.");
-                    }
-                } catch(err) {
-                    alert("Erro ao lançar busca: " + err);
-                } finally {
-                    btn.disabled = false;
-                    btn.innerText = '🚀 Lançar Busca';
-                    loadStats();
-                }
-            });
-
-            onPuzzleSelectChange();
             loadStats();
             setInterval(loadStats, 3000);
         </script>
