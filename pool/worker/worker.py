@@ -179,6 +179,13 @@ def main():
     if not reg_resp:
         print("⚠️ Warning: Nao foi possivel registrar no servidor. Tentando em segundo plano...")
 
+    # Ensure target puzzle job matches requested choice on pool server
+    http_post("/api/worker/ensure_job", {
+        "puzzle_number": TARGET_PUZZLE,
+        "start_percent": START_PCT,
+        "end_percent": END_PCT
+    })
+
     while True:
         try:
             # Request work chunk
@@ -193,6 +200,7 @@ def main():
                 })
                 time.sleep(2)
                 continue
+
             
             if work.get("status") == "WORK_ASSIGNED":
                 chunk_id = work["chunk_id"]

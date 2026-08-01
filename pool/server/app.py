@@ -371,15 +371,27 @@ def ensure_job(req: CreateJobRequest):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT job_id FROM jobs WHERE status = 'ACTIVE' LIMIT 1")
+        cursor.execute("SELECT job_id, pubkey FROM jobs WHERE status = 'ACTIVE' LIMIT 1")
         active_job = cursor.fetchone()
+        
         if active_job:
-            conn.close()
-            return {"status": "EXISTS", "job_id": active_job["job_id"]}
+            if req.puzzle_number in PUZZLE_PRESETS:
+                target_pubkey = PUZZLE_PRESETS[req.puzzle_number]["pubkey"].lower()
+                if active_job["pubkey"].lower() == target_pubkey:
+                    conn.close()
+                    return {"status": "EXISTS", "job_id": active_job["job_id"]}
+            elif req.pubkey and active_job["pubkey"].lower() == req.pubkey.lower():
+                conn.close()
+                return {"status": "EXISTS", "job_id": active_job["job_id"]}
+
+            # Deactivate old job for different puzzle
+            cursor.execute("UPDATE jobs SET status = 'CANCELLED' WHERE status = 'ACTIVE'")
+            conn.commit()
     
-    # If no active job exists, auto-create requested puzzle job
+    # If no matching active job exists, auto-create requested puzzle job
     job_id = internal_create_job(req)
     return {"status": "AUTO_CREATED", "job_id": job_id}
+
 
 @app.post("/api/worker/register")
 def register_worker(req: WorkerRegisterRequest):
