@@ -170,7 +170,21 @@ def get_binary_path() -> str:
             bin_path = os.path.join(current_dir, "RCKangaroo.exe")
         return bin_path
     else:
-        # Linux execution (Lightning.ai / Vast.ai / Colab / Kaggle)
+        # Linux execution (Lightning.ai / Vast.ai / Colab / Kaggle / Modal)
+        # Ensure CUDA libraries (libcuda.so.1, libcudart.so) are in LD_LIBRARY_PATH
+        cuda_dirs = [
+            "/usr/local/cuda/lib64",
+            "/usr/local/cuda/lib64/stubs",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/nvidia/lib",
+            "/usr/local/nvidia/lib64"
+        ]
+        valid_paths = [d for d in cuda_dirs if os.path.exists(d)]
+        if valid_paths:
+            cur_ld = os.environ.get("LD_LIBRARY_PATH", "")
+            os.environ["LD_LIBRARY_PATH"] = ":".join(valid_paths) + (f":{cur_ld}" if cur_ld else "")
+
         bin_path = os.path.join(current_dir, "rckangaroo")
         if not os.path.exists(bin_path):
             if not os.path.exists(os.path.join(current_dir, "RCKangaroo.cpp")):
@@ -178,9 +192,11 @@ def get_binary_path() -> str:
                 subprocess.run("git clone https://github.com/RetiredC/RCKangaroo.git /tmp/rck_src && cp -r /tmp/rck_src/* . && rm -rf /tmp/rck_src", shell=True, check=True)
             
             print("⚙️ Compilando binário RCKangaroo para Linux (nvcc)...")
-            build_cmd = "nvcc -O3 -std=c++17 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu -lcuda -lcudart -lpthread"
+            ld_flags = " ".join([f"-L{d}" for d in valid_paths])
+            build_cmd = f"nvcc -O3 -std=c++17 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu {ld_flags} -lcuda -lcudart -lpthread"
             subprocess.run(build_cmd, shell=True, check=True)
         return bin_path
+
 
 def enqueue_output(out, q):
     for line in iter(out.readline, ''):
@@ -289,7 +305,8 @@ def main():
                 print(f"   Executando: {' '.join(cmd)}")
                 chunk_start_time = time.time()
 
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=os.path.dirname(bin_path), bufsize=1)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=os.path.dirname(bin_path), env=os.environ, bufsize=1)
+
                 
                 out_q = queue.Queue()
                 reader_thread = threading.Thread(target=enqueue_output, args=(proc.stdout, out_q))
