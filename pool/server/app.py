@@ -185,21 +185,21 @@ PUZZLE_PRESETS = {
         "bits": 40,
         "base_start": "8000000000",
         "dp": 14,
-        "chunk_bits": 40
+        "chunk_bits": 34
     },
     50: {
         "pubkey": "03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6",
         "bits": 50,
         "base_start": "200000000000",
         "dp": 14,
-        "chunk_bits": 50
+        "chunk_bits": 40
     },
     60: {
         "pubkey": "0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d",
         "bits": 60,
         "base_start": "800000000000000",
         "dp": 14,
-        "chunk_bits": 60
+        "chunk_bits": 50
     },
     66: {
         "pubkey": "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd",
@@ -208,6 +208,7 @@ PUZZLE_PRESETS = {
         "dp": 18,
         "chunk_bits": 66
     },
+
 
     130: {
         "pubkey": "03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852",

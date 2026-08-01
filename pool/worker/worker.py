@@ -210,15 +210,19 @@ def main():
                 dp_bits = work["dp_bits"]
                 max_ops = work.get("max_ops", "1.0")
 
-                # Optimization for smaller puzzles (under 66 bits)
-                if range_bits < 60:
+                # Optimization for smaller puzzles (under 60 bits)
+                full_puzzle_range = work.get("range_bits", range_bits)
+                if full_puzzle_range < 60:
+                    exec_range_bits = full_puzzle_range
                     dp_bits = 14
                     max_ops = "10.0"
+                else:
+                    exec_range_bits = range_bits
 
                 print(f"\n🚀 Recebido Sub-bloco de Trabalho: {chunk_id}")
                 print(f"   Pubkey Alvo:  {pubkey}")
                 print(f"   Start Hex:    0x{start_hex}")
-                print(f"   Range Bits:   {range_bits} bits")
+                print(f"   Range Bits:   {exec_range_bits} bits")
                 print(f"   DP Bits:      {dp_bits}")
 
                 # Ensure RESULTS.TXT is deleted before running chunk
@@ -233,11 +237,12 @@ def main():
                     bin_path,
                     "-gpu", GPU_MASK,
                     "-dp", str(dp_bits),
-                    "-range", str(range_bits),
+                    "-range", str(exec_range_bits),
                     "-start", start_hex,
                     "-pubkey", pubkey,
                     "-max", str(max_ops)
                 ]
+
 
                 print(f"   Executando: {' '.join(cmd)}")
                 
