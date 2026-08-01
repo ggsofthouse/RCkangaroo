@@ -253,8 +253,13 @@ def main():
                 pubkey = work["pubkey"]
                 start_hex = work["start_hex"]
                 range_bits = work.get("chunk_bits", work["range_bits"])
-                dp_bits = work["dp_bits"]
+                dp_bits = work.get("dp_bits", 16)
                 max_ops = work.get("max_ops", "1.0")
+
+                # Optimization for smaller puzzles (under 66 bits)
+                if range_bits < 66:
+                    dp_bits = 16
+                    max_ops = "1000.0"
 
                 print(f"\n🚀 Recebido Sub-bloco de Trabalho: {chunk_id}")
                 print(f"   Pubkey Alvo:  {pubkey}")
@@ -279,6 +284,7 @@ def main():
                     "-pubkey", pubkey,
                     "-max", str(max_ops)
                 ]
+
 
                 print(f"   Executando: {' '.join(cmd)}")
                 chunk_start_time = time.time()
