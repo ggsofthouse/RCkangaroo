@@ -19,6 +19,54 @@ if sys.platform == "win32":
     except Exception:
         pass
 
+# SECP256K1 Mathematical Verification to prevent ANY false positives
+P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+
+def _point_add(p1, p2):
+    if p1 is None: return p2
+    if p2 is None: return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2 and y1 != y2: return None
+    if x1 == x2:
+        m = (3 * x1 * x1) * pow(2 * y1, P - 2, P) % P
+    else:
+        m = (y2 - y1) * pow(x2 - x1, P - 2, P) % P
+    x3 = (m * m - x1 - x2) % P
+    y3 = (m * (x1 - x3) - y1) % P
+    return (x3, y3)
+
+def _point_mult(k):
+    res = None
+    addend = (Gx, Gy)
+    while k:
+        if k & 1:
+            res = _point_add(res, addend)
+        addend = _point_add(addend, addend)
+        k >>= 1
+    return res
+
+def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
+    try:
+        clean_priv = privkey_hex.strip()
+        if clean_priv.startswith("0x") or clean_priv.startswith("0X"):
+            clean_priv = clean_priv[2:]
+        k = int(clean_priv, 16)
+        if k <= 0:
+            return False
+        point = _point_mult(k)
+        if not point:
+            return False
+        x, y = point
+        prefix = "02" if y % 2 == 0 else "03"
+        calc_pubkey = f"{prefix}{x:064x}".lower()
+        target_clean = target_pubkey_hex.strip().lower()
+        return calc_pubkey == target_clean
+    except Exception:
+        return False
+
 PRESETS_DISPLAY = {
     40: "Puzzle #40 (40 bits)",
     50: "Puzzle #50 (50 bits)",
@@ -159,7 +207,6 @@ def main():
     print(f"Binario Path:  {bin_path}")
     print(f"==================================================")
 
-    # Clean any old leftover RESULTS.TXT before starting worker loop
     results_file = os.path.join(os.path.dirname(bin_path), "RESULTS.TXT")
     if os.path.exists(results_file):
         try:
@@ -172,15 +219,12 @@ def main():
     last_known_mhs = 0.0
 
     # Register worker with pool server
-    reg_resp = http_post("/api/worker/register", {
+    http_post("/api/worker/register", {
         "worker_id": WORKER_ID,
         "name": WORKER_NAME,
         "os_info": f"{platform.system()} {platform.release()}",
         "gpu_info": gpu_info
     })
-    
-    if not reg_resp:
-        print("⚠️ Warning: Nao foi possivel registrar no servidor. Tentando em segundo plano...")
 
     # Ensure target puzzle job matches requested choice on pool server
     http_post("/api/worker/ensure_job", {
@@ -212,19 +256,10 @@ def main():
                 dp_bits = work["dp_bits"]
                 max_ops = work.get("max_ops", "1.0")
 
-                # Optimization for smaller puzzles (under 60 bits)
-                full_puzzle_range = work.get("range_bits", range_bits)
-                if full_puzzle_range < 60:
-                    exec_range_bits = full_puzzle_range
-                    dp_bits = 14
-                    max_ops = "10.0"
-                else:
-                    exec_range_bits = range_bits
-
                 print(f"\n🚀 Recebido Sub-bloco de Trabalho: {chunk_id}")
                 print(f"   Pubkey Alvo:  {pubkey}")
                 print(f"   Start Hex:    0x{start_hex}")
-                print(f"   Range Bits:   {exec_range_bits} bits")
+                print(f"   Range Bits:   {range_bits} bits")
                 print(f"   DP Bits:      {dp_bits}")
 
                 # Ensure RESULTS.TXT is deleted before running chunk
@@ -239,18 +274,15 @@ def main():
                     bin_path,
                     "-gpu", GPU_MASK,
                     "-dp", str(dp_bits),
-                    "-range", str(exec_range_bits),
+                    "-range", str(range_bits),
                     "-start", start_hex,
                     "-pubkey", pubkey,
                     "-max", str(max_ops)
                 ]
 
                 print(f"   Executando: {' '.join(cmd)}")
-                
-                # Record process start time
                 chunk_start_time = time.time()
 
-                # Execute process
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=os.path.dirname(bin_path), bufsize=1)
                 
                 out_q = queue.Queue()
@@ -262,7 +294,6 @@ def main():
                 found_key = None
 
                 while True:
-                    # Drain lines from process output
                     while True:
                         try:
                             line = out_q.get_nowait()
@@ -273,7 +304,7 @@ def main():
                             line_str = line.strip()
                             print(f"[RCK] {line_str}")
 
-                            # Output speed parsing
+                            # Parse Hashrate
                             mhs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*MKeys', line_str, re.IGNORECASE)
                             if mhs_match:
                                 last_known_mhs = float(mhs_match.group(1))
@@ -285,22 +316,17 @@ def main():
                                     khs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*KKeys', line_str, re.IGNORECASE)
                                     if khs_match:
                                         last_known_mhs = float(khs_match.group(1)) / 1000.0
-                                    else:
-                                        fallback_mh = re.search(r'(\d+(?:\.\d+)?)\s*(?:MKeys|MH)', line_str, re.IGNORECASE)
-                                        if fallback_mh:
-                                            last_known_mhs = float(fallback_mh.group(1))
-                                        fallback_gh = re.search(r'(\d+(?:\.\d+)?)\s*(?:GKeys|GH)', line_str, re.IGNORECASE)
-                                        if fallback_gh:
-                                            last_known_mhs = float(fallback_gh.group(1)) * 1000.0
 
-                            # Check for private key solution ONLY if pubkey matches
+                            # Parse potential solution line from stdout
                             if "PRIVATE KEY:" in line_str:
-                                print(f"\n🎉 FOUND SOLUTION IN STDOUT: {line_str}")
-                                parts = line_str.split("PRIVATE KEY:")
-                                if len(parts) >= 2:
-                                    found_key = parts[1].strip()
+                                candidate = line_str.split("PRIVATE KEY:")[-1].strip()
+                                # Mathematically verify against target pubkey
+                                if verify_private_key(candidate, pubkey):
+                                    found_key = candidate
+                                else:
+                                    print(f"⚠️ Falso positivo descartado pelo worker: {candidate}")
 
-                    # Send periodic heartbeats every 3 seconds
+                    # Heartbeat every 3s
                     if time.time() - last_heartbeat > 3:
                         http_post("/api/worker/heartbeat", {
                             "worker_id": WORKER_ID,
@@ -308,23 +334,24 @@ def main():
                         })
                         last_heartbeat = time.time()
 
-                    # Exit condition
                     if proc.poll() is not None and out_q.empty():
                         break
 
                     time.sleep(0.1)
 
-                # Check if RESULTS.TXT was generated DURING this chunk run
-                if os.path.exists(results_file) and os.path.getmtime(results_file) >= (chunk_start_time - 1):
+                # Check RESULTS.TXT if generated during this run
+                if not found_key and os.path.exists(results_file) and os.path.getmtime(results_file) >= (chunk_start_time - 1):
                     with open(results_file, "r") as rf:
-                        content = rf.read()
-                        for rline in content.split("\n"):
+                        for rline in rf.read().split("\n"):
                             if "PRIVATE KEY:" in rline:
-                                candidate_key = rline.split("PRIVATE KEY:")[-1].strip()
-                                found_key = candidate_key
+                                candidate = rline.split("PRIVATE KEY:")[-1].strip()
+                                if verify_private_key(candidate, pubkey):
+                                    found_key = candidate
+                                else:
+                                    print(f"⚠️ Falso positivo em RESULTS.TXT descartado: {candidate}")
 
                 if found_key:
-                    print(f"🌟 REAL CHAVE PRIVADA ENCONTRADA: {found_key}! Enviando ao servidor...")
+                    print(f"\n🌟 REAL CHAVE PRIVADA VERIFICADA MATEMATICAMENTE: {found_key}! Enviando ao servidor...")
                     http_post("/api/worker/submit_solution", {
                         "worker_id": WORKER_ID,
                         "chunk_id": chunk_id,
@@ -332,7 +359,7 @@ def main():
                         "private_key": found_key
                     })
                     print("🎉 Solucao enviada ao servidor com sucesso!")
-                    break  # Stop working on solved job
+                    break
 
                 print(f"✅ Chunk {chunk_id} concluido. Solicitando proximo...\n")
 

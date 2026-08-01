@@ -61,18 +61,67 @@ def base58_encode(b: bytes) -> str:
             break
     return res
 
-def hex_to_wif(privkey_hex: str, compressed: bool = True) -> str:
+def hex_to_wif(hex_key: str, compressed: bool = True) -> str:
+    clean_hex = hex_key.strip()
+    if clean_hex.startswith("0x") or clean_hex.startswith("0X"):
+        clean_hex = clean_hex[2:]
+    clean_hex = clean_hex.zfill(64)
+    raw_key = bytes.fromhex(clean_hex)
+    extended = b'\x80' + raw_key
+    if compressed:
+        extended += b'\x01'
+    first_sha = hashlib.sha256(extended).digest()
+    second_sha = hashlib.sha256(first_sha).digest()
+    checksum = second_sha[:4]
+    return base58_encode(extended + checksum)
+
+# SECP256K1 Verification Math
+_P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+_Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+_Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+
+def _point_add(p1, p2):
+    if p1 is None: return p2
+    if p2 is None: return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2 and y1 != y2: return None
+    if x1 == x2:
+        m = (3 * x1 * x1) * pow(2 * y1, _P - 2, _P) % _P
+    else:
+        m = (y2 - y1) * pow(x2 - x1, _P - 2, _P) % _P
+    x3 = (m * m - x1 - x2) % _P
+    y3 = (m * (x1 - x3) - y1) % _P
+    return (x3, y3)
+
+def _point_mult(k):
+    res = None
+    addend = (_Gx, _Gy)
+    while k:
+        if k & 1:
+            res = _point_add(res, addend)
+        addend = _point_add(addend, addend)
+        k >>= 1
+    return res
+
+def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
     try:
-        clean_hex = privkey_hex.lower().replace("0x", "").strip()
-        clean_hex = clean_hex.zfill(64)
-        raw_key = bytes.fromhex(clean_hex)
-        payload = b'\x80' + raw_key
-        if compressed:
-            payload += b'\x01'
-        checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-        return base58_encode(payload + checksum)
+        clean_priv = privkey_hex.strip()
+        if clean_priv.startswith("0x") or clean_priv.startswith("0X"):
+            clean_priv = clean_priv[2:]
+        k = int(clean_priv, 16)
+        if k <= 0:
+            return False
+        point = _point_mult(k)
+        if not point:
+            return False
+        x, y = point
+        prefix = "02" if y % 2 == 0 else "03"
+        calc_pubkey = f"{prefix}{x:064x}".lower()
+        target_clean = target_pubkey_hex.strip().lower()
+        return calc_pubkey == target_clean
     except Exception:
-        return privkey_hex
+        return False
 
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
@@ -471,9 +520,15 @@ def get_work(req: WorkRequest):
 
 @app.post("/api/worker/submit_solution")
 def submit_solution(req: SubmitSolutionRequest):
+    # Mathematically verify candidate private key against target pubkey
+    if not verify_private_key(req.private_key, req.pubkey):
+        print(f"❌ REJECTED False positive solution from worker {req.worker_id}: {req.private_key}")
+        raise HTTPException(status_code=400, detail="Invalid solution key for target pubkey")
+
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
+
         now = time.time()
         
         cursor.execute('''
