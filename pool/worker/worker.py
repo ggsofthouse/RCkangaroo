@@ -67,6 +67,26 @@ def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
     except Exception:
         return False
 
+def detect_gpus() -> str:
+    try:
+        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            gpus = [line.strip() for line in res.stdout.strip().split("\n")]
+            return ", ".join(gpus)
+    except Exception:
+        pass
+    return "NVIDIA GPU"
+
+def detect_gpu_mask() -> str:
+    try:
+        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            count = len(res.stdout.strip().split("\n"))
+            return ",".join(str(i) for i in range(count))
+    except Exception:
+        pass
+    return "0"
+
 PRESETS_DISPLAY = {
     40: "Puzzle #40 (40 bits)",
     50: "Puzzle #50 (50 bits)",
@@ -145,25 +165,7 @@ def http_post(endpoint: str, payload: dict) -> dict:
         print(f"❌ HTTP Error connecting to pool server ({url}): {e}")
         return {}
 
-def detect_gpus() -> str:
-    try:
-        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
-        if res.returncode == 0 and res.stdout.strip():
-            gpus = [line.strip() for line in res.stdout.strip().split("\n")]
-            return ", ".join(gpus)
-    except Exception:
-        pass
-    return "NVIDIA GPU"
 
-def detect_gpu_mask() -> str:
-    try:
-        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
-        if res.returncode == 0 and res.stdout.strip():
-            count = len(res.stdout.strip().split("\n"))
-            return ",".join(str(i) for i in range(count))
-    except Exception:
-        pass
-    return "0"
 
 def get_binary_path() -> str:
     system = platform.system()
