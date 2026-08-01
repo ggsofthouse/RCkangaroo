@@ -10,3 +10,14 @@ RCKangaroo/
 *.db
 __pycache__/
 .vs/
+.env
+*.env
+deploy_config.json
+vps_credentials.*
+pool/server/pool.db
+pool/server/POOL_RESULTS.TXT
+*.pem
+clean_db.py
+pool/inspect_vps.py
+
+
