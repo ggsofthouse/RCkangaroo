@@ -203,10 +203,14 @@ def get_binary_path() -> str:
                 print("⚙️ Baixando código-fonte C++/CUDA do RCKangaroo...")
                 subprocess.run("git clone https://github.com/RetiredC/RCKangaroo.git /tmp/rck_src && cp -r /tmp/rck_src/* . && rm -rf /tmp/rck_src", shell=True, check=True)
             
-            print("⚙️ Compilando binário RCKangaroo para Linux (nvcc)...")
+            print("⚙️ Compilando binário RCKangaroo para Linux (nvcc -arch=native)...")
             ld_flags = " ".join([f"-L{d}" for d in valid_paths])
-            build_cmd = f"nvcc -O3 -std=c++17 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu {ld_flags} -lcuda -lcudart -lpthread"
-            subprocess.run(build_cmd, shell=True, check=True)
+            try:
+                build_cmd = f"nvcc -O3 -std=c++17 -arch=native -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu {ld_flags} -lcuda -lcudart -lpthread"
+                subprocess.run(build_cmd, shell=True, check=True)
+            except Exception:
+                build_cmd = f"nvcc -O3 -std=c++17 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu {ld_flags} -lcuda -lcudart -lpthread"
+                subprocess.run(build_cmd, shell=True, check=True)
         return bin_path
 
 

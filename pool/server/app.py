@@ -837,18 +837,21 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     if (data.workers.length === 0) {
                         workersBody.innerHTML = `<tr><td colspan="6" class="text-center text-muted p-4">Nenhum worker ativo no momento. Ao conectar um worker (local/Vast.ai), a faixa dele aparecerá aqui automaticamente. Se o worker parar, ele é removido da lista.</td></tr>`;
                     } else {
-                        workersBody.innerHTML = data.workers.map(w => `
+                        workersBody.innerHTML = data.workers.map(w => {
+                            const hrStr = w.hashrate_mhs >= 1000 ? (w.hashrate_mhs / 1000.0).toFixed(2) + ' GH/s' : w.hashrate_mhs.toFixed(2) + ' MH/s';
+                            return `
                             <tr>
                                 <td><code>${w.worker_id}</code><br><strong>${w.name}</strong></td>
                                 <td>${w.gpu_info}</td>
-                                <td style="color: #58a6ff; font-weight: bold;">${w.hashrate_mhs.toFixed(2)} MH/s</td>
+                                <td style="color: #58a6ff; font-weight: bold;">${hrStr}</td>
                                 <td style="font-family: monospace;">
                                     <span class="badge bg-dark border border-primary text-info fs-7">${w.current_start_hex || 'Iniciando...'}</span>
                                 </td>
                                 <td><span class="badge bg-secondary fs-7">${w.completed_chunks}</span></td>
                                 <td><span class="badge bg-success">🟢 Ativo (${Math.round(Date.now()/1000 - w.last_ping)}s atrás)</span></td>
                             </tr>
-                        `).join('');
+                            `;
+                        }).join('');
                     }
 
                     // Target Active Puzzle Card
