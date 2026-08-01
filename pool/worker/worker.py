@@ -168,6 +168,9 @@ def main():
         except Exception:
             pass
 
+    # Persistent hashrate across chunks
+    last_known_mhs = 0.0
+
     # Register worker with pool server
     reg_resp = http_post("/api/worker/register", {
         "worker_id": WORKER_ID,
@@ -201,7 +204,6 @@ def main():
                 time.sleep(2)
                 continue
 
-            
             if work.get("status") == "WORK_ASSIGNED":
                 chunk_id = work["chunk_id"]
                 pubkey = work["pubkey"]
@@ -243,7 +245,6 @@ def main():
                     "-max", str(max_ops)
                 ]
 
-
                 print(f"   Executando: {' '.join(cmd)}")
                 
                 # Record process start time
@@ -257,7 +258,6 @@ def main():
                 reader_thread.daemon = True
                 reader_thread.start()
 
-                current_mhs = 0.0
                 last_heartbeat = time.time()
                 found_key = None
 
@@ -276,22 +276,22 @@ def main():
                             # Output speed parsing
                             mhs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*MKeys', line_str, re.IGNORECASE)
                             if mhs_match:
-                                current_mhs = float(mhs_match.group(1))
+                                last_known_mhs = float(mhs_match.group(1))
                             else:
                                 ghs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*GKeys', line_str, re.IGNORECASE)
                                 if ghs_match:
-                                    current_mhs = float(ghs_match.group(1)) * 1000.0
+                                    last_known_mhs = float(ghs_match.group(1)) * 1000.0
                                 else:
                                     khs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*KKeys', line_str, re.IGNORECASE)
                                     if khs_match:
-                                        current_mhs = float(khs_match.group(1)) / 1000.0
+                                        last_known_mhs = float(khs_match.group(1)) / 1000.0
                                     else:
                                         fallback_mh = re.search(r'(\d+(?:\.\d+)?)\s*(?:MKeys|MH)', line_str, re.IGNORECASE)
                                         if fallback_mh:
-                                            current_mhs = float(fallback_mh.group(1))
+                                            last_known_mhs = float(fallback_mh.group(1))
                                         fallback_gh = re.search(r'(\d+(?:\.\d+)?)\s*(?:GKeys|GH)', line_str, re.IGNORECASE)
                                         if fallback_gh:
-                                            current_mhs = float(fallback_gh.group(1)) * 1000.0
+                                            last_known_mhs = float(fallback_gh.group(1)) * 1000.0
 
                             # Check for private key solution ONLY if pubkey matches
                             if "PRIVATE KEY:" in line_str:
@@ -304,7 +304,7 @@ def main():
                     if time.time() - last_heartbeat > 3:
                         http_post("/api/worker/heartbeat", {
                             "worker_id": WORKER_ID,
-                            "hashrate_mhs": current_mhs
+                            "hashrate_mhs": last_known_mhs
                         })
                         last_heartbeat = time.time()
 
