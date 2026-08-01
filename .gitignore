@@ -1,0 +1,12 @@
+x64/
+build/
+RCKangaroo/
+*.exe
+*.obj
+*.pdb
+*.iobj
+*.tlog
+*.log
+*.db
+__pycache__/
+.vs/

@@ -52,12 +52,15 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	path[0] = 0;
 //	GetExeDir(path, 500);
 //	strcat(path, "/");
-	if (Is5xxx)
-		strcat(path, "kernel_sm120.cubin");
-	else
-		strcat(path, "kernel_sm89.cubin");
-	if (!cc.LoadCubin(path))
-		return false;
+	if (sm_inv_cnt > 0)
+	{
+		if (Is5xxx)
+			strcat(path, "kernel_sm120.cubin");
+		else
+			strcat(path, "kernel_sm89.cubin");
+		if (!cc.LoadCubin(path))
+			return false;
+	}
 
 	Kparams.BlockCnt = mpCnt - sm_inv_cnt;
 	Kparams.BlockSize = BLOCK_SIZE;
@@ -65,8 +68,16 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	KangCnt = Kparams.BlockSize * Kparams.GroupCnt * Kparams.BlockCnt;
 	Kparams.KangCnt = KangCnt;
 	Kparams.DP = DP;
-	Kparams.KernelA_LDS_Size = 98 * 1024;
-	Kparams.KernelB_LDS_Size = 48 * 1024;
+	if (sm_inv_cnt > 0)
+	{
+		Kparams.KernelA_LDS_Size = 98 * 1024;
+		Kparams.KernelB_LDS_Size = 48 * 1024;
+	}
+	else
+	{
+		Kparams.KernelA_LDS_Size = 32 * 1024;
+		Kparams.KernelB_LDS_Size = 48 * 1024;
+	}
 	Kparams.KernelC_LDS_Size = 96 * JMP_CNT;
 	Kparams.IsGenMode = gGenMode;
 	Kparams.dp_mask = (u32)((1ull << DP) - 1);

@@ -1,8 +1,10 @@
 cmake_minimum_required(VERSION 3.17)
 
-# Must be set before project(), because this project compiles a .cu file.
-set(CUDAToolkit_ROOT "/usr/local/cuda-12.8" CACHE PATH "CUDA Toolkit root")
-set(CMAKE_CUDA_COMPILER "${CUDAToolkit_ROOT}/bin/nvcc" CACHE FILEPATH "CUDA compiler")
+if(WIN32)
+    if(NOT DEFINED CUDAToolkit_ROOT AND EXISTS "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3")
+        set(CUDAToolkit_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3" CACHE PATH "CUDA Toolkit root")
+    endif()
+endif()
 
 project(rckangaroo
     VERSION 1.0

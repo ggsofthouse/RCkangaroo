@@ -583,16 +583,12 @@ void CallGpuKernelGen(TKparams Kparams)
 cudaError_t cuSetGpuParams(TKparams Kparams, u64* _jmp2_table)
 {
 	cudaError_t err = cudaFuncSetAttribute(KernelA, cudaFuncAttributeMaxDynamicSharedMemorySize, Kparams.KernelA_LDS_Size);
-	if (err != cudaSuccess)
-		return err;
+	if (err != cudaSuccess) return err;
 	err = cudaFuncSetAttribute(KernelB, cudaFuncAttributeMaxDynamicSharedMemorySize, Kparams.KernelB_LDS_Size);
-	if (err != cudaSuccess)
-		return err;
+	if (err != cudaSuccess) return err;
 	err = cudaFuncSetAttribute(KernelC, cudaFuncAttributeMaxDynamicSharedMemorySize, Kparams.KernelC_LDS_Size);
-	if (err != cudaSuccess)
-		return err;
+	if (err != cudaSuccess) return err;
 	err = cudaMemcpyToSymbol(jmp2_table, _jmp2_table, JMP_CNT * 64);
-	if (err != cudaSuccess)
-		return err;
+	if (err != cudaSuccess) return err;
 	return cudaSuccess;
 }

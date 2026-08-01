@@ -321,6 +321,7 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	int min = (int)(sec - days * (3600 * 24) - hours * 3600) / 60;
 	 
 	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
+	fflush(stdout);
 }
 
 bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
@@ -337,6 +338,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	}
 
 	printf("\r\nSolving point: Range %d bits, DP %d, start...\r\n", Range, DP);
+	fflush(stdout);
 	double ops = 1.15 * pow(2.0, Range / 2.0);
 	double dp_val = (double)(1ull << DP);
 	u64 total_kangs = GpuKangs[0]->CalcKangCnt();
@@ -345,6 +347,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	double path_single_kang = ops / total_kangs;
 	double DPs_per_kang = path_single_kang / dp_val;
 	printf("Estimated DPs per kangaroo (ideal): %.2f.%s\r\n", DPs_per_kang, (DPs_per_kang < 5) ? " DP overhead is big, use less DP value if possible!" : "");
+	fflush(stdout);
 
 	if (DPs_per_kang < 0.001)
 		DPs_per_kang = 0.001;
@@ -356,6 +359,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	ram += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
 	ram /= (1024 * 1024 * 1024); //GB
 	printf("SOTA v2 method, estimated ops: 2^%.3f, RAM for DPs: %.3f GB.\r\n", log2(ops), ram);
+	fflush(stdout);
 	gIsOpsLimit = false;
 	double MaxTotalOps = 0.0;
 	if (gMax > 0)
@@ -365,6 +369,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		ram_max += sizeof(TListRec) * 256 * 256 * 256; //3byte-prefix table
 		ram_max /= (1024 * 1024 * 1024); //GB
 		printf("Max allowed number of ops: 2^%.3f, max RAM for DPs: %.3f GB\r\n", log2(MaxTotalOps), ram_max);
+		fflush(stdout);
 	}
 
 
@@ -383,6 +388,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		}
 		else
 			printf("tames loading failed\r\n");
+		fflush(stdout);
 	}
 
 	SetRndSeed(0); //use same seed to make tames from file compatible
@@ -441,6 +447,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 
 	u64 tm0 = GetTickCount64();
 	printf("GPUs started...\r\n");
+	fflush(stdout);
 
 #ifdef _WIN32
 	HANDLE thr_handles[MAX_GPU_CNT];
@@ -465,7 +472,7 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 	{
 		CheckNewPoints();
 		Sleep(10);
-		if (GetTickCount64() - tm_stats > 10 * 1000)
+		if (GetTickCount64() - tm_stats > 2 * 1000)
 		{
 			ShowStats(tm0, ops, dp_val);
 			tm_stats = GetTickCount64();
