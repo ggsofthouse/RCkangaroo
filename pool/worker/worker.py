@@ -199,10 +199,13 @@ def main():
                 pubkey = work["pubkey"]
                 start_hex = work["start_hex"]
                 range_bits = work.get("chunk_bits", work["range_bits"])
-                if range_bits < 48:
-                    range_bits = 66
                 dp_bits = work["dp_bits"]
                 max_ops = work.get("max_ops", "1.0")
+
+                # Optimization for smaller puzzles (under 66 bits)
+                if range_bits < 60:
+                    dp_bits = 14
+                    max_ops = "10.0"
 
                 print(f"\n🚀 Recebido Sub-bloco de Trabalho: {chunk_id}")
                 print(f"   Pubkey Alvo:  {pubkey}")
