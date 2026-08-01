@@ -82,7 +82,7 @@ def detect_gpu_mask() -> str:
         res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
         if res.returncode == 0 and res.stdout.strip():
             count = len(res.stdout.strip().split("\n"))
-            return ",".join(str(i) for i in range(count))
+            return "".join(str(i) for i in range(count))
     except Exception:
         pass
     return "0"
