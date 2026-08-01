@@ -86,7 +86,7 @@ parser.add_argument("--name", type=str, default=os.environ.get("WORKER_NAME", f"
 parser.add_argument("--puzzle", type=int, default=int(os.environ.get("TARGET_PUZZLE", "66")), help="Target Bitcoin Puzzle Number")
 parser.add_argument("--start-pct", type=float, default=float(os.environ.get("START_PCT", "0.0")), help="Start Range Percentage (0.0 to 100.0)")
 parser.add_argument("--end-pct", type=float, default=float(os.environ.get("END_PCT", "100.0")), help="End Range Percentage (0.0 to 100.0)")
-parser.add_argument("--gpu", type=str, default=os.environ.get("GPU_MASK", "0"), help="GPU Device Mask (e.g. 0 or 01)")
+parser.add_argument("--gpu", type=str, default=os.environ.get("GPU_MASK", None), help="GPU Device Mask (e.g. 0,1 or 01)")
 parser.add_argument("--non-interactive", action="store_true", help="Skip interactive prompts")
 
 args, unknown = parser.parse_known_args()
@@ -96,7 +96,7 @@ WORKER_NAME = args.name
 TARGET_PUZZLE = args.puzzle
 START_PCT = args.start_pct
 END_PCT = args.end_pct
-GPU_MASK = args.gpu
+GPU_MASK = args.gpu if args.gpu is not None else detect_gpu_mask()
 WORKER_ID = f"{WORKER_NAME}-{int(time.time()) % 10000}"
 
 # Interactive terminal prompt if user launches worker directly without explicit CLI flags
@@ -155,6 +155,16 @@ def detect_gpus() -> str:
         pass
     return "NVIDIA GPU"
 
+def detect_gpu_mask() -> str:
+    try:
+        res = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            count = len(res.stdout.strip().split("\n"))
+            return ",".join(str(i) for i in range(count))
+    except Exception:
+        pass
+    return "0"
+
 def get_binary_path() -> str:
     system = platform.system()
     current_dir = os.path.abspath(os.getcwd())
@@ -193,7 +203,7 @@ def get_binary_path() -> str:
             
             print("⚙️ Compilando binário RCKangaroo para Linux (nvcc)...")
             ld_flags = " ".join([f"-L{d}" for d in valid_paths])
-            build_cmd = f"nvcc -O3 -std=c++17 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu {ld_flags} -lcuda -lcudart -lpthread"
+            build_cmd = f"nvcc -O3 -std=c++17 -gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu {ld_flags} -lcuda -lcudart -lpthread"
             subprocess.run(build_cmd, shell=True, check=True)
         return bin_path
 
