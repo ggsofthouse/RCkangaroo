@@ -207,6 +207,11 @@ def init_db():
             except Exception:
                 pass
 
+        try:
+            cursor.execute("ALTER TABLE workers ADD COLUMN current_job_id TEXT")
+        except Exception:
+            pass
+
         conn.commit()
         conn.close()
 
@@ -222,6 +227,7 @@ class CreateJobRequest(BaseModel):
     range_bits: Optional[int] = None
     dp_bits: int = 18
     chunk_bits: int = 66
+    worker_id: Optional[str] = None
 
 class WorkerRegisterRequest(BaseModel):
     worker_id: str
@@ -291,7 +297,7 @@ PUZZLE_PRESETS = {
         "pubkey": "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640",
         "bits": 140,
         "base_start": "80000000000000000000000000000000000",
-        "dp": 18
+        "dp": 15  # Otimizado: DP 15 elimina 322% de overhead em chunks de 66-bits (era 18)
     },
     145: {
         "pubkey": "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5",
@@ -377,8 +383,117 @@ def clear_jobs(username: str = Depends(authenticate_dashboard)):
         conn.close()
     return {"status": "CLEARED"}
 
+def generate_coverage_report():
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        now = time.time()
+        
+        cursor.execute("SELECT * FROM jobs WHERE status IN ('ACTIVE', 'SOLVED', 'COMPLETED') ORDER BY start_percent ASC")
+        jobs = [dict(j) for j in cursor.fetchall()]
+        
+        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < 60", (now,))
+        raw_w = cursor.fetchall()
+        active_workers = {dict(w)['current_job_id']: dict(w)['name'] for w in raw_w if dict(w).get('current_job_id')}
+        
+        report_lines = []
+        report_lines.append("======================================================================")
+        report_lines.append("       RCKangaroo Pool - Relatório de Cobertura & Anti-Sobreposição   ")
+        report_lines.append(f"       Atualizado em: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+        report_lines.append("======================================================================\n")
+
+        scanned_ranges = []
+        active_ranges = []
+        all_covered_intervals = []
+
+        if jobs:
+            report_lines.append("✅ [FAIXAS JÁ VARRIDAS E CONCLUÍDAS (EXCLUÍDAS DE RETRABALHO)]")
+            scanned_count = 0
+            for j in jobs:
+                s_pct = float(j.get('start_percent', 0.0))
+                e_pct = float(j.get('end_percent', 100.0))
+                
+                scanned_pct = s_pct
+                try:
+                    start_offset_int = int(j.get('start_hex', '0'), 16)
+                    current_offset_int = int(j.get('current_offset_hex', j.get('start_hex', '0')), 16)
+                    bits = j.get('range_bits', 139)
+                    total_range_int = 1 << bits
+                    if total_range_int > 0 and current_offset_int > start_offset_int:
+                        progress_ratio = (current_offset_int - start_offset_int) / float(total_range_int)
+                        scanned_pct = min(e_pct, s_pct + progress_ratio * (e_pct - s_pct))
+                except Exception:
+                    scanned_pct = s_pct
+
+                if j['status'] in ('SOLVED', 'COMPLETED'):
+                    scanned_pct = e_pct
+
+                if scanned_pct > s_pct + 0.001:
+                    scanned_count += 1
+                    scanned_ranges.append((s_pct, scanned_pct))
+                    report_lines.append(f"  • Faixa Varrida: {s_pct:.2f}% → {scanned_pct:.2f}% (Concluída - Sub-bloco Hex: 0x{j.get('current_offset_hex', '0')})")
+
+                all_covered_intervals.append((s_pct, e_pct))
+                
+                if j['status'] == 'ACTIVE' and scanned_pct < e_pct:
+                    w_name = active_workers.get(j['job_id'], "Worker Ativo")
+                    active_ranges.append((scanned_pct, e_pct, w_name, j['job_id'], j.get('current_offset_hex', '0')))
+
+            if scanned_count == 0:
+                report_lines.append("  (Nenhum sub-bloco concluído ainda - workers iniciando varredura...)")
+            report_lines.append("")
+
+            report_lines.append("🟢 [FAIXAS EM MINERAÇÃO ATIVA NO MOMENTO]")
+            if active_ranges:
+                for act_s, act_e, w_name, j_id, cur_hex in active_ranges:
+                    report_lines.append(f"  • Em Progresso: {act_s:.2f}% → {act_e:.2f}% | Worker: {w_name} | Sub-bloco Hex: 0x{cur_hex}")
+            else:
+                report_lines.append("  ⚠️ Nenhuma faixa em mineração no momento.")
+            report_lines.append("")
+        else:
+            report_lines.append("⚠️ Nenhuma faixa ativa no momento.\n")
+
+        # Calculate free/unexplored gaps between 0.0% and 100.0%
+        all_covered_intervals.sort(key=lambda x: x[0])
+        free_gaps = []
+        curr = 0.0
+        for s_pct, e_pct in all_covered_intervals:
+            if s_pct > curr + 0.05:
+                free_gaps.append((round(curr, 2), round(s_pct, 2)))
+            curr = max(curr, e_pct)
+        if curr < 99.95:
+            free_gaps.append((round(curr, 2), 100.0))
+
+        report_lines.append("🆓 [FAIXAS LIVRES E INTOCADAS (RECOMENDADAS PARA NOVOS WORKERS)]")
+        if free_gaps:
+            for g_start, g_end in free_gaps:
+                report_lines.append(f"  ✓ Faixa Livre: {g_start:.2f}% → {g_end:.2f}% (LIVRE - Use esta faixa para novos Workers!)")
+        else:
+            report_lines.append("  🎉 100% do range do Puzzle está totalmente coberto!")
+
+        report_lines.append("\n======================================================================")
+        report_text = "\n".join(report_lines)
+        
+        filepath = os.path.join(os.path.dirname(__file__), "COVERAGE.TXT")
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(report_text)
+        except Exception as e:
+            print(f"Error writing COVERAGE.TXT: {e}")
+            
+        return {
+            "text": report_text,
+            "scanned_ranges": scanned_ranges,
+            "free_gaps": free_gaps
+        }
+
+@app.get("/api/coverage")
+def get_coverage_endpoint():
+    return generate_coverage_report()
+
 @app.get("/api/stats")
 def get_stats(username: str = Depends(authenticate_dashboard)):
+    cov_data = generate_coverage_report()
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
@@ -402,6 +517,29 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             else:
                 w_dict['current_start_hex'] = "Aguardando tarefa..."
                 w_dict['current_range_bits'] = "-"
+            
+            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE assigned_worker = ? AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'],))
+            w_dict['completed_chunks'] = cursor.fetchone()['cnt']
+            
+            if w_dict.get('current_job_id'):
+                cursor.execute("SELECT start_percent, end_percent FROM jobs WHERE job_id = ?", (w_dict['current_job_id'],))
+                cj = cursor.fetchone()
+                if cj:
+                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
+                else:
+                    w_dict['assigned_range'] = "0% → 100%"
+            else:
+                cursor.execute("""
+                    SELECT j.start_percent, j.end_percent FROM chunks c 
+                    JOIN jobs j ON c.job_id = j.job_id 
+                    WHERE c.assigned_worker = ? ORDER BY c.assigned_at DESC LIMIT 1
+                """, (w_dict['worker_id'],))
+                cj = cursor.fetchone()
+                if cj:
+                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
+                else:
+                    w_dict['assigned_range'] = "0% → 100%"
+
             workers.append(w_dict)
             
         total_hashrate = sum(w['hashrate_mhs'] for w in workers)
@@ -449,7 +587,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "total_pool_hashrate_mhs": round(total_hashrate, 2),
             "total_pool_hashrate_ghs": round(total_hashrate / 1000.0, 3),
             "workers": workers,
-            "jobs": jobs
+            "jobs": jobs,
+            "coverage": cov_data
         }
 
 # Open Worker Endpoints (Auto-Creates Job if No Active Job Exists)
@@ -458,25 +597,47 @@ def ensure_job(req: CreateJobRequest):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute("SELECT job_id, pubkey FROM jobs WHERE status = 'ACTIVE' LIMIT 1")
-        active_job = cursor.fetchone()
         
-        if active_job:
-            if req.puzzle_number in PUZZLE_PRESETS:
-                target_pubkey = PUZZLE_PRESETS[req.puzzle_number]["pubkey"].lower()
-                if active_job["pubkey"].lower() == target_pubkey:
-                    conn.close()
-                    return {"status": "EXISTS", "job_id": active_job["job_id"]}
-            elif req.pubkey and active_job["pubkey"].lower() == req.pubkey.lower():
-                conn.close()
-                return {"status": "EXISTS", "job_id": active_job["job_id"]}
+        target_pubkey = None
+        if req.puzzle_number in PUZZLE_PRESETS:
+            target_pubkey = PUZZLE_PRESETS[req.puzzle_number]["pubkey"].lower()
+        elif req.pubkey:
+            target_pubkey = req.pubkey.lower()
 
-            # Deactivate old job for different puzzle
-            cursor.execute("UPDATE jobs SET status = 'CANCELLED' WHERE status = 'ACTIVE'")
+        if target_pubkey:
+            # Check if active job for exact same pubkey and matching range % already exists
+            cursor.execute("""
+                SELECT job_id FROM jobs 
+                WHERE status = 'ACTIVE' 
+                AND LOWER(pubkey) = ? 
+                AND ABS(start_percent - ?) < 0.01 
+                AND ABS(end_percent - ?) < 0.01 
+                LIMIT 1
+            """, (target_pubkey, req.start_percent, req.end_percent))
+            range_job = cursor.fetchone()
+
+            if range_job:
+                job_id = range_job["job_id"]
+                if req.worker_id:
+                    cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
+                conn.commit()
+                conn.close()
+                return {"status": "EXISTS", "job_id": job_id}
+
+            # Deactivate jobs for a completely different puzzle
+            cursor.execute("UPDATE jobs SET status = 'CANCELLED' WHERE status = 'ACTIVE' AND LOWER(pubkey) != ?", (target_pubkey,))
             conn.commit()
+            conn.close()
     
-    # If no matching active job exists, auto-create requested puzzle job
+    # Auto-create job for this specific range
     job_id = internal_create_job(req)
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        if req.worker_id:
+            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
+            conn.commit()
+        conn.close()
     return {"status": "AUTO_CREATED", "job_id": job_id}
 
 
@@ -486,8 +647,13 @@ def register_worker(req: WorkerRegisterRequest):
         conn = get_db()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO workers (worker_id, name, os_info, gpu_info, hashrate_mhs, last_ping)
-            VALUES (?, ?, ?, ?, 0.0, ?)
+            INSERT INTO workers (worker_id, name, os_info, gpu_info, hashrate_mhs, last_ping, completed_chunks)
+            VALUES (?, ?, ?, ?, 0.0, ?, 0)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                name=excluded.name,
+                os_info=excluded.os_info,
+                gpu_info=excluded.gpu_info,
+                last_ping=excluded.last_ping
         ''', (req.worker_id, req.name, req.os_info, req.gpu_info, time.time()))
         conn.commit()
         conn.close()
@@ -515,14 +681,43 @@ def get_work(req: WorkRequest):
             cursor.execute("UPDATE workers SET last_ping = ?, hashrate_mhs = ? WHERE worker_id = ?", (time.time(), req.hashrate_mhs, req.worker_id))
         else:
             cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (time.time(), req.worker_id))
-        conn.commit()
 
-        cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at ASC LIMIT 1")
+        # Mark previous assigned chunks for this worker as COMPLETED (since worker is now requesting next chunk)
+        cursor.execute("""
+            UPDATE chunks SET status = 'COMPLETED' 
+            WHERE assigned_worker = ? AND status = 'ASSIGNED'
+        """, (req.worker_id,))
+
+        # 1. Primary lookup: active job linked via workers.current_job_id
+        cursor.execute("""
+            SELECT j.* FROM jobs j 
+            JOIN workers w ON w.current_job_id = j.job_id 
+            WHERE w.worker_id = ? AND j.status = 'ACTIVE' 
+            LIMIT 1
+        """, (req.worker_id,))
         job = cursor.fetchone()
+
+        # 2. Secondary lookup: recent job chunks for this worker
+        if not job:
+            cursor.execute("""
+                SELECT j.* FROM chunks c
+                JOIN jobs j ON c.job_id = j.job_id
+                WHERE c.assigned_worker = ? AND j.status = 'ACTIVE'
+                ORDER BY c.assigned_at DESC LIMIT 1
+            """, (req.worker_id,))
+            job = cursor.fetchone()
+
+        # 3. Fallback: latest active job
+        if not job:
+            cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
+            job = cursor.fetchone()
 
         if not job:
             conn.close()
             return {"status": "NO_WORK", "message": "No active jobs available"}
+
+        # Link worker to this active job
+        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job['job_id'], req.worker_id))
 
         current_offset_int = int(job['current_offset_hex'], 16)
         chunk_bits = min(job['chunk_bits'], job['range_bits'])
@@ -530,7 +725,20 @@ def get_work(req: WorkRequest):
             chunk_bits = 66
             
         chunk_size = 1 << chunk_bits
-        
+
+        # 🛡️ TRAVA DE FIM DE FATIA: calcula o endereço hex final do job
+        # e impede que o ponteiro vaze além do end_percent da fatia.
+        base_start_int = int(job['base_start_hex'], 16)
+        total_range_int = 1 << job['range_bits']
+        end_pct = float(job['end_percent'])
+        end_offset_int = base_start_int + int((end_pct / 100.0) * total_range_int)
+
+        if current_offset_int >= end_offset_int:
+            conn.commit()
+            conn.close()
+            print(f"✅ Job {job['job_id']} atingiu o fim da fatia ({end_pct:.2f}%). Retornando NO_WORK.")
+            return {"status": "NO_WORK", "message": f"Fatia concluída até {end_pct:.2f}%"}
+
         chunk_id = f"{job['job_id']}_chunk_{hex(current_offset_int)[2:]}"
         chunk_start_hex = hex(current_offset_int)[2:]
         
@@ -638,6 +846,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     <span class="badge bg-success">Autenticado</span>
                 </div>
                 <div class="d-flex flex-wrap gap-2">
+                    <button class="btn btn-outline-info btn-sm fw-bold" onclick="openCoverageModal()">📄 Ver Relatório (COVERAGE.TXT)</button>
                     <button class="btn btn-outline-danger btn-sm" onclick="clearOldJobs()">🗑️ Limpar Jobs / Testes</button>
                     <button class="btn btn-outline-primary btn-sm" onclick="loadStats()">🔄 Atualizar</button>
                 </div>
@@ -684,7 +893,8 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                 <th>Worker ID / Nome</th>
                                 <th>Hardware GPU</th>
                                 <th>Hashrate</th>
-                                <th>Faixa / Sub-bloco Atual Inicializado</th>
+                                <th>Faixa Atribuída (%)</th>
+                                <th>Sub-bloco Hex Atual</th>
                                 <th>Chunks Concluídos</th>
                                 <th>Status (Último Ping)</th>
                             </tr>
@@ -839,20 +1049,29 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     // Render Active Workers & Their Live Started Ranges
                     const workersBody = document.getElementById('workers-table-body');
                     if (data.workers.length === 0) {
-                        workersBody.innerHTML = `<tr><td colspan="6" class="text-center text-muted p-4">Nenhum worker ativo no momento. Ao conectar um worker (local/Vast.ai), a faixa dele aparecerá aqui automaticamente. Se o worker parar, ele é removido da lista.</td></tr>`;
+                        workersBody.innerHTML = `<tr><td colspan="7" class="text-center text-muted p-4">Nenhum worker ativo no momento. Ao conectar um worker (local/Vast.ai), a faixa dele aparecerá aqui automaticamente. Se o worker parar, ele é removido da lista.</td></tr>`;
                     } else {
                         workersBody.innerHTML = data.workers.map(w => {
                             const hrStr = w.hashrate_mhs >= 1000 ? (w.hashrate_mhs / 1000.0).toFixed(2) + ' GH/s' : w.hashrate_mhs.toFixed(2) + ' MH/s';
+                            const chunksBadge = w.completed_chunks > 0 ?
+                                `<span class="badge bg-success fs-7 px-3 py-1 fw-bold">${w.completed_chunks} chunks</span>` :
+                                `<span class="badge bg-dark border border-secondary text-muted fs-7 px-2 py-1">${w.completed_chunks} chunks</span>`;
+                            const rangeBadge = `<span class="badge bg-gradient bg-primary fs-6 px-3 py-2 border border-info shadow-sm" style="font-size: 0.92rem !important; letter-spacing: 0.5px;">${w.assigned_range || '0% → 100%'}</span>`;
+                            const hexBadge = `<span class="badge bg-black border border-info text-info fs-7 px-2 py-1 font-monospace">${w.current_start_hex || 'Iniciando...'}</span>`;
+                            const pingSecs = Math.max(0, Math.round(Date.now()/1000 - w.last_ping));
+                            
                             return `
                             <tr>
-                                <td><code>${w.worker_id}</code><br><strong>${w.name}</strong></td>
-                                <td>${w.gpu_info}</td>
-                                <td style="color: #58a6ff; font-weight: bold;">${hrStr}</td>
-                                <td style="font-family: monospace;">
-                                    <span class="badge bg-dark border border-primary text-info fs-7">${w.current_start_hex || 'Iniciando...'}</span>
+                                <td>
+                                    <strong class="text-light fs-6">${w.name}</strong><br>
+                                    <code class="text-muted fs-7">${w.worker_id}</code>
                                 </td>
-                                <td><span class="badge bg-secondary fs-7">${w.completed_chunks}</span></td>
-                                <td><span class="badge bg-success">🟢 Ativo (${Math.round(Date.now()/1000 - w.last_ping)}s atrás)</span></td>
+                                <td><span class="text-secondary fs-7">${w.gpu_info}</span></td>
+                                <td style="color: #58a6ff; font-weight: bold; font-size: 1.05rem;">${hrStr}</td>
+                                <td>${rangeBadge}</td>
+                                <td>${hexBadge}</td>
+                                <td>${chunksBadge}</td>
+                                <td><span class="badge bg-success-subtle text-success border border-success px-2 py-1 fs-7">🟢 Ativo (${pingSecs}s atrás)</span></td>
                             </tr>
                             `;
                         }).join('');
@@ -860,44 +1079,47 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
                     // Target Active Puzzle Card
                     const targetContainer = document.getElementById('active-target-puzzle-container');
-                    const activeJob = data.jobs.find(j => j.status === 'ACTIVE');
+                    const activeJobs = data.jobs.filter(j => j.status === 'ACTIVE');
 
-                    if (activeJob) {
+                    if (activeJobs.length > 0) {
+                        const firstActive = activeJobs[0];
+                        const totalAssigned = activeJobs.reduce((acc, j) => acc + (j.total_chunks_assigned || 0), 0);
+                        const totalCompleted = activeJobs.reduce((acc, j) => acc + (j.completed_chunks || 0), 0);
+                        const minStart = Math.min(...activeJobs.map(j => j.start_percent));
+                        const maxEnd = Math.max(...activeJobs.map(j => j.end_percent));
+                        const rangeBadges = activeJobs.map(j => `<span class="badge bg-primary fs-7 me-1 mb-1" title="Job ${j.job_id}">${j.start_percent.toFixed(1)}% → ${j.end_percent.toFixed(1)}%</span>`).join('');
+
                         targetContainer.innerHTML = `
                             <div class="card p-4 border border-info shadow-sm">
-                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
                                     <div class="d-flex align-items-center">
                                         <span class="fs-4 me-2">🎯</span>
-                                        <h4 class="mb-0 text-info fw-bold">${activeJob.puzzle_name}</h4>
-                                        <span class="badge bg-success ms-3 fs-6">Em Busca Ativa</span>
+                                        <h4 class="mb-0 text-info fw-bold">${firstActive.puzzle_name}</h4>
+                                        <span class="badge bg-success ms-3 fs-6">Em Busca Ativa (${activeJobs.length} Jobs Simultâneos)</span>
                                     </div>
-                                    <div>
-                                        <span class="badge bg-dark border border-secondary text-light fs-6 me-2">Range: ${activeJob.range_bits} bits</span>
-                                        <span class="badge bg-primary fs-6 me-2">Faixa Definida: ${activeJob.start_percent.toFixed(2)}% → ${activeJob.end_percent.toFixed(2)}%</span>
-                                        <span class="badge bg-secondary fs-6 me-2">Chunks Atribuídos: ${activeJob.total_chunks_assigned}</span>
-                                        <span class="badge bg-success fs-6">Chunks Concluídos: ${activeJob.completed_chunks}</span>
+                                    <div class="d-flex flex-wrap align-items-center gap-2">
+                                        <span class="badge bg-dark border border-secondary text-light fs-6">Range Total: ${minStart.toFixed(1)}% → ${maxEnd.toFixed(1)}%</span>
+                                        <span class="badge bg-secondary fs-6">Chunks Atribuídos Total: ${totalAssigned}</span>
+                                        <span class="badge bg-success fs-6">Chunks Concluídos Total: ${totalCompleted}</span>
                                     </div>
+                                </div>
+                                <div class="mb-3">
+                                    <span class="stat-sub me-2">FAIXAS ATIVAS EM PROCESSAMENTO:</span>
+                                    <div class="d-inline-flex flex-wrap mt-1">${rangeBadges}</div>
                                 </div>
                                 <div class="row g-3">
                                     <div class="col-md-6">
                                         <div class="stat-sub">CHAVE PÚBLICA ALVO (PUBLIC KEY):</div>
                                         <div class="d-flex align-items-center mt-1">
-                                            <div class="key-box text-info flex-grow-1 me-2" style="font-size: 0.88rem;">${activeJob.pubkey}</div>
-                                            <button class="btn btn-sm btn-outline-info" onclick="copyText('${activeJob.pubkey}')">📋 Copiar</button>
+                                            <div class="key-box text-info flex-grow-1 me-2" style="font-size: 0.88rem;">${firstActive.pubkey}</div>
+                                            <button class="btn btn-sm btn-outline-info" onclick="copyText('${firstActive.pubkey}')">📋 Copiar</button>
                                         </div>
                                     </div>
                                     <div class="col-md-6">
                                         <div class="stat-sub">ENDEREÇO BITCOIN ALVO (CORRESPONDENTE):</div>
                                         <div class="d-flex align-items-center mt-1">
-                                            <div class="key-box text-warning flex-grow-1 me-2" style="font-size: 0.95rem; font-weight: bold;">${activeJob.btc_address}</div>
-                                            <button class="btn btn-sm btn-outline-warning" onclick="copyText('${activeJob.btc_address}')">📋 Copiar</button>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-12">
-                                        <div class="d-flex justify-content-between text-muted fs-7 mt-1">
-                                            <span>Start Offset Hex Atual: <code class="text-light">0x${activeJob.start_hex}</code></span>
-                                            <span>Base Start Hex: <code class="text-light">0x${activeJob.base_start_hex}</code></span>
-                                            <span>Tamanho de Sub-bloco (Chunk): <code class="text-info">${activeJob.chunk_bits || 66} bits</code></span>
+                                            <div class="key-box text-warning flex-grow-1 me-2" style="font-size: 0.95rem; font-weight: bold;">${firstActive.btc_address}</div>
+                                            <button class="btn btn-sm btn-outline-warning" onclick="copyText('${firstActive.btc_address}')">📋 Copiar</button>
                                         </div>
                                     </div>
                                 </div>
@@ -949,9 +1171,44 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 }
             }
 
+            async function openCoverageModal() {
+                try {
+                    const res = await fetch('/api/coverage');
+                    const data = await res.json();
+                    document.getElementById('coverage-report-content').innerText = data.text;
+                    const modal = new bootstrap.Modal(document.getElementById('coverageModal'));
+                    modal.show();
+                } catch(e) {
+                    alert("Erro ao carregar COVERAGE.TXT: " + e);
+                }
+            }
+
             loadStats();
             setInterval(loadStats, 3000);
         </script>
+
+        <!-- Coverage Report Modal -->
+        <div class="modal fade" id="coverageModal" tabindex="-1" aria-hidden="true">
+            <div class="modal-dialog modal-lg modal-dialog-centered">
+                <div class="modal-content bg-dark text-light border border-info shadow-lg">
+                    <div class="modal-header border-secondary">
+                        <h5 class="modal-title text-info fw-bold">📄 Relatório de Cobertura & Anti-Sobreposição (COVERAGE.TXT)</h5>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body">
+                        <div class="mb-3">
+                            <span class="text-muted fs-7">Este relatório é gerado automaticamente e salvo na VPS (`/opt/rckangaroo/pool/server/COVERAGE.TXT`) para evitar retrabalho e mostrar exatamente quais faixas estão <strong>livres e recomendadas</strong> para novos Workers:</span>
+                        </div>
+                        <pre id="coverage-report-content" class="bg-black text-success p-3 rounded border border-secondary" style="font-family: monospace; white-space: pre-wrap; font-size: 0.88rem; max-height: 400px; overflow-y: auto;"></pre>
+                    </div>
+                    <div class="modal-footer border-secondary">
+                        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Fechar</button>
+                        <a href="/api/coverage" target="_blank" class="btn btn-sm btn-outline-info">📥 Abrir COVERAGE.TXT Direto</a>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     </body>
     </html>
     """

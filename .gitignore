@@ -19,5 +19,8 @@ pool/server/POOL_RESULTS.TXT
 *.pem
 clean_db.py
 pool/inspect_vps.py
-
-
+pool/fetch_live_vps.py
+pool/deploy_vps.py
+pool/recreate_10_jobs.py
+pool/test_fixes.py
+RESULTS.TXT
