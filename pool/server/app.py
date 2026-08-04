@@ -635,24 +635,22 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE assigned_worker = ? AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'],))
             w_dict['completed_chunks'] = cursor.fetchone()['cnt']
             
-            if w_dict.get('current_job_id'):
+            # Prioriza a faixa do chunk ativo que o worker está processando
+            cursor.execute("""
+                SELECT j.start_percent, j.end_percent FROM chunks c 
+                JOIN jobs j ON c.job_id = j.job_id 
+                WHERE c.assigned_worker = ? ORDER BY c.assigned_at DESC LIMIT 1
+            """, (w_dict['worker_id'],))
+            cj = cursor.fetchone()
+            
+            if not cj and w_dict.get('current_job_id'):
                 cursor.execute("SELECT start_percent, end_percent FROM jobs WHERE job_id = ?", (w_dict['current_job_id'],))
                 cj = cursor.fetchone()
-                if cj:
-                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
-                else:
-                    w_dict['assigned_range'] = "0% → 100%"
+
+            if cj:
+                w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
             else:
-                cursor.execute("""
-                    SELECT j.start_percent, j.end_percent FROM chunks c 
-                    JOIN jobs j ON c.job_id = j.job_id 
-                    WHERE c.assigned_worker = ? ORDER BY c.assigned_at DESC LIMIT 1
-                """, (w_dict['worker_id'],))
-                cj = cursor.fetchone()
-                if cj:
-                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
-                else:
-                    w_dict['assigned_range'] = "0% → 100%"
+                w_dict['assigned_range'] = "0% → 100%"
 
             workers.append(w_dict)
             
