@@ -391,7 +391,7 @@ PUZZLE_PRESETS = {
         "pubkey": "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483",
         "bits": 70,
         "base_start": "200000000000000000",
-        "chunk_bits": 70
+        "chunk_bits": 55
     },
     130: {
         "pubkey": "03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852",
@@ -753,6 +753,21 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
 
             if range_job:
                 job_id = range_job["job_id"]
+                # Se o job existente já atingiu o fim da fatia, reseta o offset para permitir novo teste
+                cursor.execute("SELECT start_hex, base_start_hex, range_bits, end_percent, current_offset_hex FROM jobs WHERE job_id = ?", (job_id,))
+                row = cursor.fetchone()
+                if row:
+                    try:
+                        cur_off = int(row['current_offset_hex'], 16)
+                        b_start = int(row['base_start_hex'], 16)
+                        tot_r = 1 << int(row['range_bits'])
+                        e_off = b_start + int((float(row['end_percent']) / 100.0) * tot_r)
+                        if cur_off >= e_off:
+                            cursor.execute("UPDATE jobs SET current_offset_hex = start_hex WHERE job_id = ?", (job_id,))
+                            cursor.execute("UPDATE chunks SET status = 'CANCELLED' WHERE job_id = ?", (job_id,))
+                    except Exception:
+                        pass
+
                 if req.worker_id:
                     cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
                 conn.commit()
