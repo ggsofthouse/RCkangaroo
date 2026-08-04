@@ -21,12 +21,13 @@ def download_worker_script():
     return FileResponse(worker_file, media_type="text/x-python", filename="worker.py")
 
 
-# Enable CORS
+# CORS restrito ao domínio configurado na VPS
+_ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[_ALLOWED_ORIGIN] if _ALLOWED_ORIGIN else [],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
@@ -34,9 +35,32 @@ DB_FILE = os.path.join(os.path.dirname(__file__), "pool.db")
 db_lock = threading.RLock()
 security = HTTPBasic()
 
+# ─── Credenciais do Dashboard (nunca hardcode — lidas do ambiente da VPS) ──────
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "")
+DASHBOARD_PASS = os.environ.get("DASHBOARD_PASS", "")
+if not DASHBOARD_USER or not DASHBOARD_PASS:
+    raise RuntimeError(
+        "⛔ DASHBOARD_USER e DASHBOARD_PASS devem estar definidos como variáveis de ambiente. "
+        "Defina-os no arquivo .env da VPS ou via docker-compose."
+    )
+
+# ─── Token de autenticação para workers ─────────────────────────────────────────
+WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+if not WORKER_TOKEN:
+    raise RuntimeError(
+        "⛔ WORKER_TOKEN deve estar definido como variável de ambiente. "
+        "Configure-o no .env da VPS e no start_worker.sh dos containers."
+    )
+
+def verify_worker_token(request: Request):
+    """Dependência usada em todos os endpoints de worker para validar o token."""
+    token = request.headers.get("X-Worker-Token", "")
+    if not secrets.compare_digest(token, WORKER_TOKEN):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token de worker inválido")
+
 def authenticate_dashboard(credentials: HTTPBasicCredentials = Depends(security)):
-    is_correct_username = secrets.compare_digest(credentials.username, "fogaca05")
-    is_correct_password = secrets.compare_digest(credentials.password, "Ti210911@")
+    is_correct_username = secrets.compare_digest(credentials.username, DASHBOARD_USER)
+    is_correct_password = secrets.compare_digest(credentials.password, DASHBOARD_PASS)
     if not (is_correct_username and is_correct_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -212,10 +236,66 @@ def init_db():
         except Exception:
             pass
 
+        # Adiciona colunas de controle de conclusão real nos chunks
+        chunks_cols = [
+            ("completed_at", "REAL"),
+            ("heartbeat_at", "REAL"),
+        ]
+        for col_name, col_type in chunks_cols:
+            try:
+                cursor.execute(f"ALTER TABLE chunks ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+
+        conn.commit()
+
+        # WAL mode: múltiplos leitores simultâneos sem bloquear escritas
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.commit()
         conn.close()
 
 init_db()
+
+# ─── Background: recoloca chunks abandonados de volta para PENDING ────────────
+# Timeout configurável por env var: chunks grandes (90-bits) podem durar horas
+CHUNK_TIMEOUT_SECONDS = int(os.environ.get("CHUNK_TIMEOUT_SECONDS", "3600"))  # default 1h
+WORKER_ALIVE_SECONDS  = int(os.environ.get("WORKER_ALIVE_SECONDS",  "90"))    # heartbeat threshold
+
+def _recover_abandoned_chunks():
+    """Thread que roda a cada 60s e recupera chunks ASSIGNED cujo worker sumiu."""
+    while True:
+        time.sleep(60)
+        try:
+            with db_lock:
+                conn = get_db()
+                cursor = conn.cursor()
+                now = time.time()
+                cutoff = now - CHUNK_TIMEOUT_SECONDS
+
+                # Chunks ASSIGNED mas cujo worker não fez ping nos últimos CHUNK_TIMEOUT_SECONDS
+                cursor.execute('''
+                    UPDATE chunks SET status = 'PENDING', assigned_worker = NULL, assigned_at = NULL
+                    WHERE status = 'ASSIGNED'
+                    AND chunk_id IN (
+                        SELECT c.chunk_id FROM chunks c
+                        LEFT JOIN workers w ON w.worker_id = c.assigned_worker
+                        WHERE c.status = 'ASSIGNED'
+                        AND (w.last_ping IS NULL OR w.last_ping < ?)
+                    )
+                ''', (cutoff,))
+
+                recovered = cursor.rowcount
+                if recovered > 0:
+                    print(f"♻️  Recovered {recovered} abandoned chunk(s) back to PENDING (timeout={CHUNK_TIMEOUT_SECONDS}s)")
+
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            print(f"⚠️  Error in chunk recovery thread: {e}")
+
+_recovery_thread = threading.Thread(target=_recover_abandoned_chunks, daemon=True)
+_recovery_thread.start()
 
 # Pydantic Schemas
 class CreateJobRequest(BaseModel):
@@ -243,6 +323,10 @@ class WorkRequest(BaseModel):
     worker_id: str
     hashrate_mhs: Optional[float] = None
 
+class CompleteChunkRequest(BaseModel):
+    worker_id: str
+    chunk_id: str
+
 class SubmitSolutionRequest(BaseModel):
     worker_id: str
     chunk_id: str
@@ -250,66 +334,64 @@ class SubmitSolutionRequest(BaseModel):
     private_key: str
 
 # Preset Puzzles Dictionary (Dados Oficiais dos Desafios Bitcoin)
+# chunk_bits: tamanho de cada fatia de trabalho por puzzle
+#   Puzzles pequenos (≤66 bits): chunks menores (~66 bits), completam em segundos/minutos
+#   Puzzles grandes (130+ bits): chunks de 80-90 bits, cada um dura horas por worker
+#   dp (é calculado dinamicamente em get_work): dp = max(14, (chunk_bits//2) - 2)
 PUZZLE_PRESETS = {
     40: {
         "pubkey": "03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4",
         "bits": 40,
         "base_start": "8000000000",
-        "dp": 14,
         "chunk_bits": 34
     },
     50: {
         "pubkey": "03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6",
         "bits": 50,
         "base_start": "200000000000",
-        "dp": 14,
         "chunk_bits": 40
     },
     60: {
         "pubkey": "0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d",
         "bits": 60,
         "base_start": "800000000000000",
-        "dp": 14,
         "chunk_bits": 50
     },
     66: {
         "pubkey": "024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd",
         "bits": 66,
         "base_start": "20000000000000000",
-        "dp": 18,
         "chunk_bits": 66
     },
-
-
     130: {
         "pubkey": "03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852",
         "bits": 130,
         "base_start": "20000000000000000000000000000000",
-        "dp": 18
+        "chunk_bits": 80   # ~15-30 min por chunk em GPU potente
     },
     135: {
         "pubkey": "02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16",
         "bits": 135,
         "base_start": "4000000000000000000000000000000004",
-        "dp": 18
+        "chunk_bits": 80
     },
     140: {
         "pubkey": "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640",
         "bits": 140,
         "base_start": "80000000000000000000000000000000000",
-        "dp": 15  # Otimizado: DP 15 elimina 322% de overhead em chunks de 66-bits (era 18)
+        "chunk_bits": 90   # ~2-6h por chunk em RTX 4090/5090 — menos overhead de coordenação
     },
     145: {
         "pubkey": "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5",
         "bits": 145,
         "base_start": "1000000000000000000000000000000000000",
-        "dp": 18
+        "chunk_bits": 90
     },
     150: {
         "pubkey": "03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49",
         "bits": 150,
         "base_start": "20000000000000000000000000000000000000",
-        "dp": 18
+        "chunk_bits": 90
     }
 }
 
@@ -333,7 +415,8 @@ def internal_create_job(req: CreateJobRequest) -> str:
             start_hex = hex(start_offset_int)[2:]
             base_start_hex = preset["base_start"]
             range_bits = bits - 1
-            dp_bits = preset["dp"]
+            chunk_bits_to_use = preset.get("chunk_bits", req.chunk_bits)
+            dp_bits = 0  # será calculado dinamicamente em get_work
         else:
             pubkey = req.pubkey.lower().strip() if req.pubkey else PUZZLE_PRESETS[66]["pubkey"]
             clean_start = req.start_hex.lower().replace("0x", "").strip() if req.start_hex else "20000000000000000"
@@ -343,12 +426,13 @@ def internal_create_job(req: CreateJobRequest) -> str:
             start_offset_int += int((start_pct / 100.0) * total_range_int)
             start_hex = hex(start_offset_int)[2:]
             base_start_hex = clean_start
+            chunk_bits_to_use = req.chunk_bits
             dp_bits = req.dp_bits
 
         cursor.execute('''
             INSERT INTO jobs (job_id, pubkey, start_hex, range_bits, dp_bits, chunk_bits, start_percent, end_percent, base_start_hex, current_offset_hex, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (job_id, pubkey.lower(), start_hex, range_bits, dp_bits, req.chunk_bits, start_pct, end_pct, base_start_hex, start_hex, time.time()))
+        ''', (job_id, pubkey.lower(), start_hex, range_bits, dp_bits, chunk_bits_to_use, start_pct, end_pct, base_start_hex, start_hex, time.time()))
         
         conn.commit()
         conn.close()
@@ -392,7 +476,7 @@ def generate_coverage_report():
         cursor.execute("SELECT * FROM jobs WHERE status IN ('ACTIVE', 'SOLVED', 'COMPLETED') ORDER BY start_percent ASC")
         jobs = [dict(j) for j in cursor.fetchall()]
         
-        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < 60", (now,))
+        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < ?", (now, WORKER_ALIVE_SECONDS))
         raw_w = cursor.fetchall()
         active_workers = {dict(w)['current_job_id']: dict(w)['name'] for w in raw_w if dict(w).get('current_job_id')}
         
@@ -500,7 +584,7 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         now = time.time()
         
         # Workers active within the last 60 seconds
-        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < 60 ORDER BY last_ping DESC", (now,))
+        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < ? ORDER BY last_ping DESC", (now, WORKER_ALIVE_SECONDS))
         raw_workers = [dict(w) for w in cursor.fetchall()]
         
         workers = []
@@ -593,7 +677,7 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
 
 # Open Worker Endpoints (Auto-Creates Job if No Active Job Exists)
 @app.post("/api/worker/ensure_job")
-def ensure_job(req: CreateJobRequest):
+def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
@@ -642,7 +726,7 @@ def ensure_job(req: CreateJobRequest):
 
 
 @app.post("/api/worker/register")
-def register_worker(req: WorkerRegisterRequest):
+def register_worker(req: WorkerRegisterRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
@@ -660,7 +744,7 @@ def register_worker(req: WorkerRegisterRequest):
     return {"status": "REGISTERED", "worker_id": req.worker_id}
 
 @app.post("/api/worker/heartbeat")
-def heartbeat(req: WorkerHeartbeatRequest):
+def heartbeat(req: WorkerHeartbeatRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
@@ -672,7 +756,7 @@ def heartbeat(req: WorkerHeartbeatRequest):
     return {"status": "OK"}
 
 @app.post("/api/worker/get_work")
-def get_work(req: WorkRequest):
+def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
@@ -681,12 +765,6 @@ def get_work(req: WorkRequest):
             cursor.execute("UPDATE workers SET last_ping = ?, hashrate_mhs = ? WHERE worker_id = ?", (time.time(), req.hashrate_mhs, req.worker_id))
         else:
             cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (time.time(), req.worker_id))
-
-        # Mark previous assigned chunks for this worker as COMPLETED (since worker is now requesting next chunk)
-        cursor.execute("""
-            UPDATE chunks SET status = 'COMPLETED' 
-            WHERE assigned_worker = ? AND status = 'ASSIGNED'
-        """, (req.worker_id,))
 
         # 1. Primary lookup: active job linked via workers.current_job_id
         cursor.execute("""
@@ -751,6 +829,16 @@ def get_work(req: WorkRequest):
             VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED')
         ''', (chunk_id, job['job_id'], chunk_start_hex, chunk_bits, req.worker_id, time.time()))
 
+        # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
+        # Limite HARD do binário RCKangaroo: DP deve estar entre 14 e 32 (RCKangaroo.cpp:334)
+        # dp = min(32, max(14, (chunk_bits // 2) - 2))
+        # Para chunk 66-bits: dp=31 | Para chunk 80-bits: dp=32 | Para chunk 90-bits: dp=32
+        dp_bits_dynamic = min(32, max(14, (chunk_bits // 2) - 2))
+
+        # max_ops = (chunk_bits / range_bits) * 2.5  com margem probabilística
+        # Garante que o RCKangaroo rode o tempo suficiente para cobrir o chunk
+        max_ops_dynamic = round((chunk_bits / job['range_bits']) * 2.5, 2)
+
         conn.commit()
         conn.close()
 
@@ -762,12 +850,43 @@ def get_work(req: WorkRequest):
             "start_hex": chunk_start_hex,
             "range_bits": job['range_bits'],
             "chunk_bits": chunk_bits,
-            "dp_bits": job['dp_bits'],
-            "max_ops": "1.0"
+            "dp_bits": dp_bits_dynamic,
+            "max_ops": str(max_ops_dynamic)
         }
 
+@app.post("/api/worker/complete_chunk")
+def complete_chunk(req: CompleteChunkRequest, _: None = Depends(verify_worker_token)):
+    """Worker chama este endpoint quando termina um chunk com sucesso (sem encontrar a chave).
+    Só então o chunk é marcado como COMPLETED — elimina falsos positivos.
+    """
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        now = time.time()
+
+        cursor.execute("""
+            UPDATE chunks SET status = 'COMPLETED', completed_at = ?
+            WHERE chunk_id = ? AND assigned_worker = ? AND status = 'ASSIGNED'
+        """, (now, req.chunk_id, req.worker_id))
+
+        updated = cursor.rowcount
+        if updated > 0:
+            cursor.execute(
+                "UPDATE workers SET last_ping = ?, completed_chunks = completed_chunks + 1 WHERE worker_id = ?",
+                (now, req.worker_id)
+            )
+            print(f"✅ Chunk {req.chunk_id} marcado como COMPLETED pelo worker {req.worker_id}")
+        else:
+            print(f"⚠️  complete_chunk ignorado: chunk {req.chunk_id} não estava ASSIGNED para {req.worker_id}")
+
+        conn.commit()
+        conn.close()
+
+    return {"status": "OK", "completed": updated > 0}
+
+
 @app.post("/api/worker/submit_solution")
-def submit_solution(req: SubmitSolutionRequest):
+def submit_solution(req: SubmitSolutionRequest, _: None = Depends(verify_worker_token)):
     # Mathematically verify candidate private key against target pubkey
     if not verify_private_key(req.private_key, req.pubkey):
         print(f"❌ REJECTED False positive solution from worker {req.worker_id}: {req.private_key}")

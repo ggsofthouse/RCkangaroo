@@ -5,6 +5,17 @@ Write-Host "Servidor: https://valyrafi.com.br" -ForegroundColor Green
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host ""
 
+# Lê WORKER_TOKEN do .env
+$EnvFile = Join-Path $PSScriptRoot ".env"
+$WorkerToken = ""
+foreach ($line in Get-Content $EnvFile) {
+    if ($line -match "^WORKER_TOKEN=(.+)$") { $WorkerToken = $Matches[1] }
+}
+if ([string]::IsNullOrWhiteSpace($WorkerToken)) {
+    Write-Host "❌ WORKER_TOKEN não encontrado no .env!" -ForegroundColor Red
+    exit 1
+}
+
 $PuzzleNum = Read-Host "👉 Digite o numero do Puzzle (ex: 140) [padrao: 140]"
 if ([string]::IsNullOrWhiteSpace($PuzzleNum)) { $PuzzleNum = "140" }
 
@@ -23,4 +34,5 @@ Write-Host "==================================================" -ForegroundColor
 Write-Host ""
 
 Set-Location $PSScriptRoot
-python pool/worker/worker.py --server https://valyrafi.com.br --name "Local-RTX2060" --puzzle $PuzzleNum --start-pct $StartPct --end-pct $EndPct --non-interactive
+python pool/worker/worker.py --server https://valyrafi.com.br --name "Local-RTX2060" --puzzle $PuzzleNum --start-pct $StartPct --end-pct $EndPct --token $WorkerToken --non-interactive
+

@@ -103,10 +103,11 @@ PRESETS_DISPLAY = {
 parser = argparse.ArgumentParser(description="RCKangaroo Mining Pool Worker")
 parser.add_argument("--server", type=str, default=os.environ.get("POOL_SERVER_URL", "https://valyrafi.com.br"), help="Pool Coordinator Server URL")
 parser.add_argument("--name", type=str, default=os.environ.get("WORKER_NAME", f"Worker-{socket.gethostname()}"), help="Worker Name")
-parser.add_argument("--puzzle", type=int, default=int(os.environ.get("TARGET_PUZZLE", "66")), help="Target Bitcoin Puzzle Number")
+parser.add_argument("--puzzle", type=int, default=int(os.environ.get("TARGET_PUZZLE", "140")), help="Target Bitcoin Puzzle Number")
 parser.add_argument("--start-pct", type=float, default=float(os.environ.get("START_PCT", "0.0")), help="Start Range Percentage (0.0 to 100.0)")
 parser.add_argument("--end-pct", type=float, default=float(os.environ.get("END_PCT", "100.0")), help="End Range Percentage (0.0 to 100.0)")
 parser.add_argument("--gpu", type=str, default=os.environ.get("GPU_MASK", None), help="GPU Device Mask (e.g. 0,1 or 01)")
+parser.add_argument("--token", type=str, default=os.environ.get("WORKER_TOKEN", ""), help="Token de autenticação da pool (WORKER_TOKEN)")
 parser.add_argument("--non-interactive", action="store_true", help="Skip interactive prompts")
 
 args, unknown = parser.parse_known_args()
@@ -118,6 +119,12 @@ START_PCT = args.start_pct
 END_PCT = args.end_pct
 GPU_MASK = args.gpu if args.gpu is not None else detect_gpu_mask()
 WORKER_ID = f"{WORKER_NAME}-{int(time.time()) % 10000}"
+WORKER_TOKEN = args.token
+
+if not WORKER_TOKEN:
+    print("\n⛔ ERRO: WORKER_TOKEN não definido!")
+    print("   Defina via --token SEU_TOKEN ou variável de ambiente WORKER_TOKEN")
+    sys.exit(1)
 
 # Interactive terminal prompt if user launches worker directly without explicit CLI flags
 if sys.stdin and sys.stdin.isatty() and not getattr(args, 'non_interactive', False) and not any(arg.startswith("--puzzle") for arg in sys.argv[1:]):
@@ -157,12 +164,18 @@ if sys.stdin and sys.stdin.isatty() and not getattr(args, 'non_interactive', Fal
 def http_post(endpoint: str, payload: dict) -> dict:
     url = urllib.parse.urljoin(SERVER_URL, endpoint)
     data = json.dumps(payload).encode('utf-8')
-    req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            'Content-Type': 'application/json',
+            'X-Worker-Token': WORKER_TOKEN
+        }
+    )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read().decode('utf-8'))
     except Exception as e:
-        print(f"❌ HTTP Error connecting to pool server ({url}): {e}")
+        print(f"\u274c HTTP Error connecting to pool server ({url}): {e}")
         return {}
 
 
@@ -285,13 +298,10 @@ def main():
                 pubkey = work["pubkey"]
                 start_hex = work["start_hex"]
                 range_bits = work.get("chunk_bits", work["range_bits"])
-                dp_bits = work.get("dp_bits", 16)
-                max_ops = work.get("max_ops", "1.0")
-
-                # Optimization for smaller puzzles (under 66 bits)
-                if range_bits < 66:
-                    dp_bits = 16
-                    max_ops = "1000.0"
+                # dp_bits e max_ops calculados dinamicamente pelo servidor
+                # (dp = max(14, chunk_bits//2 - 2) | max = chunk_bits/range_bits * 2.5)
+                dp_bits = work.get("dp_bits", 31)
+                max_ops = work.get("max_ops", "1.62")
 
                 print(f"\n🚀 Recebido Sub-bloco de Trabalho: {chunk_id}")
                 print(f"   Pubkey Alvo:  {pubkey}")
@@ -365,8 +375,8 @@ def main():
                                 else:
                                     print(f"⚠️ Falso positivo descartado pelo worker: {candidate}")
 
-                    # Heartbeat every 1s
-                    if time.time() - last_heartbeat >= 1:
+                    # Heartbeat a cada 30s — reduz pressão no SQLite com chunks grandes
+                    if time.time() - last_heartbeat >= 30:
                         http_post("/api/worker/heartbeat", {
                             "worker_id": WORKER_ID,
                             "hashrate_mhs": last_known_mhs
@@ -405,7 +415,12 @@ def main():
                     print("🎉 Solucao enviada ao servidor com sucesso!")
                     break
 
-                print(f"✅ Chunk {chunk_id} concluido. Solicitando proximo...\n")
+                # Confirma explicitamente a conclusão do chunk ao servidor
+                http_post("/api/worker/complete_chunk", {
+                    "worker_id": WORKER_ID,
+                    "chunk_id": chunk_id
+                })
+                print(f"✅ Chunk {chunk_id} concluido e confirmado. Solicitando proximo...\n")
 
         except KeyboardInterrupt:
             print("\n🛑 Worker interrompido pelo usuario.")
