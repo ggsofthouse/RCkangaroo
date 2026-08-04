@@ -387,6 +387,12 @@ PUZZLE_PRESETS = {
         "base_start": "20000000000000000",
         "chunk_bits": 66
     },
+    70: {
+        "pubkey": "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483",
+        "bits": 70,
+        "base_start": "200000000000000000",
+        "chunk_bits": 70
+    },
     130: {
         "pubkey": "03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852",
         "bits": 130,
@@ -1269,6 +1275,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 '50': { pubkey: '03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6', bits: 50, base_start: '200000000000', btc_address: '172W6cD98Vj2Pn126nZxPvEyc288eP8p39' },
                 '60': { pubkey: '0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d', bits: 60, base_start: '800000000000000', btc_address: '16jY7qLJn2yGwhmMvVbEFTHmyCpNXnBLvi' },
                 '66': { pubkey: '024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd', bits: 66, base_start: '20000000000000000', btc_address: '13zb1hQbWVsc2S7ZTGarEbrmcHbotPhvqD' },
+                '70': { pubkey: '0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483', bits: 70, base_start: '200000000000000000', btc_address: '19YZECXj3SxEZMoUeJ1yiPsw8xANe7M7QR' },
                 '130': { pubkey: '03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852', bits: 130, base_start: '20000000000000000000000000000000', btc_address: '1LHtnPD8vUPG2NRSsfTQ5zWbX2SLW23yAs' },
                 '135': { pubkey: '02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16', bits: 135, base_start: '4000000000000000000000000000000004', btc_address: '16R2y56L7bg69U5d76D491j2vV6yS451z4' },
                 '140': { pubkey: '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640', bits: 140, base_start: '80000000000000000000000000000000000', btc_address: '1QKBaU6WAeycb3DbKbLBkX7vJiaS8r42Xo' },

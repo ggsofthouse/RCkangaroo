@@ -92,6 +92,7 @@ PRESETS_DISPLAY = {
     50: "Puzzle #50 (50 bits)",
     60: "Puzzle #60 (60 bits)",
     66: "Puzzle #66 (66 bits)",
+    70: "Puzzle #70 (70 bits)",
     130: "Puzzle #130 (130 bits)",
     135: "Puzzle #135 (135 bits)",
     140: "Puzzle #140 (140 bits)",
