@@ -187,7 +187,8 @@ def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
         return False
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout = 30000;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -692,11 +693,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                     j_dict['solved_at_str'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(j_dict['solved_at']))
             jobs.append(j_dict)
 
-        conn.close()
-
         # Calcula soma real de chaves e total de chunks concluidos
         total_completed_chunks = sum(j['completed_chunks'] for j in jobs)
-        cursor = get_db().cursor()
         cursor.execute("SELECT range_bits FROM chunks WHERE status IN ('COMPLETED', 'SOLVED')")
         rows = cursor.fetchall()
         keys_tested = sum(2**int(r[0]) for r in rows)
@@ -737,6 +735,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 h = up_sec // 3600
                 m = (up_sec % 3600) // 60
                 active_job_uptime = f"{h}h {m}m"
+
+        conn.close()
 
         return {
             "active_workers_count": len(workers),
