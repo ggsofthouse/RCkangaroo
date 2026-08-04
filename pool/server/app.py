@@ -891,11 +891,11 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
 
         # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
         # Meta: K ≈ 1.15–1.25 (overhead 15–25%)
-        # Medição: dp=26 → K=2.52 (119%). Reduzir 3 bits (8x DPs) → K≈1.19
-        # dp_ideal ≈ (chunk_bits // 2) - 22  →  90-bit: 23, 80-bit: 18, 66-bit: 14
-        # Cap máximo em 23; mínimo 14 (limite hard do binário RCKangaroo)
-        # RAM dp=23 para 90-bit: ~1.9 GB/GPU (ok para 31 GB disponíveis)
-        dp_bits_dynamic = min(23, max(14, (chunk_bits // 2) - 22))
+        # Medições reais:  dp=32 → K=12.52 | dp=26 → K=2.52 | dp=23 → K=1.49 (29%)
+        # dp=22 (1 bit a menos, 2x DPs) → overhead≈0.245 → K≈1.24 ✓  RAM≈0.84 GB/GPU
+        # dp=21 → K≈1.12 (abaixo do alvo); dp=22 é o ponto certo
+        # dp_ideal ≈ (chunk_bits // 2) - 23  →  90-bit: 22, 80-bit: 17, 66-bit: 14(min)
+        dp_bits_dynamic = min(22, max(14, (chunk_bits // 2) - 23))
 
         # max_ops = (chunk_bits / range_bits) * 1.5  — margem segura com K≈1.2
         max_ops_dynamic = round((chunk_bits / job['range_bits']) * 1.5, 2)
