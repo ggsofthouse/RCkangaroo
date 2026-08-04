@@ -19,6 +19,7 @@ if [ ! -f "/app/rckangaroo" ]; then
     echo "✅ Linux binary compiled successfully!"
 fi
 
-echo "🚀 Starting RCKangaroo Worker connecting to: ${POOL_SERVER_URL:-https://valyrafi.com.br}"
-python3 /app/pool/worker/worker.py --token "$WORKER_TOKEN" --non-interactive
+_POOL_URL="${POOL_SERVER_URL:-http://127.0.0.1:8000}"
+echo "🚀 Starting RCKangaroo Worker connecting to: ${_POOL_URL}"
+python3 /app/pool/worker/worker.py --server "${_POOL_URL}" --token "$WORKER_TOKEN" --non-interactive
 
