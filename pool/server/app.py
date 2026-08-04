@@ -865,24 +865,41 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         cursor.execute("""
             SELECT j.* FROM jobs j 
             JOIN workers w ON w.current_job_id = j.job_id 
-            WHERE w.worker_id = ? AND j.status = 'ACTIVE' 
+            WHERE (w.worker_id = ? OR w.name = ?) AND j.status = 'ACTIVE' 
             LIMIT 1
-        """, (req.worker_id,))
+        """, (req.worker_id, req.name or req.worker_id))
         job = cursor.fetchone()
 
-        # 2. Secondary lookup: recent job chunks for this worker
+        # 2. Name-based explicit range lookup (e.g. Vast-2x-A1 -> 0-6%, Vast-2x-A2 -> 6-12%, etc.)
+        if not job and req.name:
+            pct_map = {'A1': 0.0, 'A2': 6.0, 'A3': 12.0, 'A4': 18.0, 'A5': 24.0, 'A6': 85.0, 'A7': 90.0, 'A8': 95.0}
+            for k, pct in pct_map.items():
+                if k in req.name:
+                    cursor.execute("SELECT * FROM jobs WHERE ABS(start_percent - ?) < 0.1 AND status = 'ACTIVE' LIMIT 1", (pct,))
+                    job = cursor.fetchone()
+                    if job:
+                        break
+
+        # 3. Tertiary lookup: recent job chunks for this worker
         if not job:
             cursor.execute("""
                 SELECT j.* FROM chunks c
                 JOIN jobs j ON c.job_id = j.job_id
-                WHERE c.assigned_worker = ? AND j.status = 'ACTIVE'
+                WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?) AND j.status = 'ACTIVE'
                 ORDER BY c.assigned_at DESC LIMIT 1
-            """, (req.worker_id,))
+            """, (req.worker_id, f"{req.name}%" if req.name else req.worker_id))
             job = cursor.fetchone()
 
-        # 3. Fallback: latest active job
+        # 4. Fallback: pick active job with least assigned chunks
         if not job:
-            cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
+            cursor.execute("""
+                SELECT j.*, COUNT(c.chunk_id) as cnt FROM jobs j 
+                LEFT JOIN chunks c ON c.job_id = j.job_id AND c.status = 'ASSIGNED' 
+                WHERE j.status = 'ACTIVE' 
+                GROUP BY j.job_id 
+                ORDER BY cnt ASC, j.created_at ASC 
+                LIMIT 1
+            """)
             job = cursor.fetchone()
 
         if not job:
