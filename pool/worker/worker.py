@@ -164,7 +164,7 @@ if sys.stdin and sys.stdin.isatty() and not getattr(args, 'non_interactive', Fal
     except Exception:
         pass
 
-def http_post(endpoint: str, payload: dict) -> dict:
+def http_post(endpoint: str, payload: dict, retries: int = 3) -> dict:
     url = urllib.parse.urljoin(SERVER_URL, endpoint)
     data = json.dumps(payload).encode('utf-8')
     req = urllib.request.Request(
@@ -174,12 +174,17 @@ def http_post(endpoint: str, payload: dict) -> dict:
             'X-Worker-Token': WORKER_TOKEN
         }
     )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode('utf-8'))
-    except Exception as e:
-        print(f"\u274c HTTP Error connecting to pool server ({url}): {e}")
-        return {}
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(2)
+                continue
+            print(f"❌ HTTP Error connecting to pool server ({url}): {e}")
+            return {}
+    return {}
 
 def http_get(endpoint: str) -> dict:
     url = urllib.parse.urljoin(SERVER_URL, endpoint)
@@ -190,9 +195,10 @@ def http_get(endpoint: str) -> dict:
         }
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode('utf-8'))
-    except Exception:
+    except Exception as e:
+        print(f"❌ HTTP Error connecting to pool server ({url}): {e}")
         return {}
 
 def ensure_tames_file(puzzle_number: int, bin_dir: str) -> Optional[str]:

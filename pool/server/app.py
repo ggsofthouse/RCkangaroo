@@ -187,7 +187,8 @@ def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
         return False
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30.0)
+    conn.execute("PRAGMA busy_timeout = 30000;")
     conn.row_factory = sqlite3.Row
     return conn
 
