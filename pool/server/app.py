@@ -666,10 +666,31 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
 
         conn.close()
 
+        # Calcula soma real de chaves e total de chunks concluidos
+        total_completed_chunks = sum(j['completed_chunks'] for j in jobs)
+        cursor = get_db().cursor()
+        cursor.execute("SELECT range_bits FROM chunks WHERE status IN ('COMPLETED', 'SOLVED')")
+        rows = cursor.fetchall()
+        keys_tested = sum(2**int(r[0]) for r in rows)
+        keys_zetta = keys_tested / (10**21)
+        keys_exa   = keys_tested / (10**18)
+        
+        if keys_zetta >= 1_000_000:
+            keys_zetta_str = f"{keys_zetta/1_000_000:.2f} M Zetakeys"
+        elif keys_zetta >= 1_000:
+            keys_zetta_str = f"{keys_zetta/1_000:.2f} K Zetakeys"
+        elif keys_zetta >= 1:
+            keys_zetta_str = f"{keys_zetta:.2f} Zetakeys"
+        else:
+            keys_zetta_str = f"{keys_exa:.2f} Exakeys"
+
         return {
             "active_workers_count": len(workers),
             "total_pool_hashrate_mhs": round(total_hashrate, 2),
             "total_pool_hashrate_ghs": round(total_hashrate / 1000.0, 3),
+            "total_completed_chunks": total_completed_chunks,
+            "keys_tested": keys_tested,
+            "keys_zetta_str": keys_zetta_str,
             "workers": workers,
             "jobs": jobs,
             "coverage": cov_data
@@ -927,86 +948,248 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>RCKangaroo Pool Coordinator Dashboard</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
         <style>
-            body { background-color: #0d1117; color: #c9d1d9; font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; }
-            .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 12px; }
-            .stat-header { font-size: 2.2rem; font-weight: bold; color: #58a6ff; }
-            .stat-sub { color: #8b949e; font-size: 0.82rem; letter-spacing: 1px; }
-            .table-dark { background-color: #161b22; color: #c9d1d9; border-color: #30363d; }
-            .solved-banner {
-                background: linear-gradient(135deg, rgba(35, 134, 54, 0.25) 0%, rgba(22, 27, 34, 0.95) 100%);
-                border: 2px solid #238636;
-                box-shadow: 0 0 25px rgba(35, 134, 54, 0.4);
-                border-radius: 12px;
+            :root {
+                --bg-body: #080c14;
+                --bg-card: #101726;
+                --bg-card-hover: #162034;
+                --border-color: #1e293b;
+                --border-glow: rgba(59, 130, 246, 0.25);
+                --text-primary: #f8fafc;
+                --text-secondary: #94a3b8;
+                --text-muted: #64748b;
+                --accent-cyan: #38bdf8;
+                --accent-green: #22c55e;
+                --accent-amber: #f59e0b;
+                --accent-purple: #a855f7;
             }
+
+            body {
+                background-color: var(--bg-body);
+                color: var(--text-primary);
+                font-family: 'Outfit', -apple-system, sans-serif;
+                min-height: 100vh;
+            }
+
+            .glass-card {
+                background: linear-gradient(135deg, rgba(16, 23, 38, 0.95) 0%, rgba(12, 17, 28, 0.98) 100%);
+                border: 1px solid var(--border-color);
+                border-radius: 16px;
+                box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
+                backdrop-filter: blur(12px);
+                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            .glass-card:hover {
+                border-color: var(--border-glow);
+                box-shadow: 0 12px 35px -10px rgba(56, 189, 248, 0.15);
+            }
+
+            .stat-card {
+                position: relative;
+                overflow: hidden;
+                padding: 1.5rem;
+            }
+            .stat-card::before {
+                content: '';
+                position: absolute;
+                top: 0; left: 0; width: 100%; height: 3px;
+                background: linear-gradient(90deg, transparent, var(--accent-color, var(--accent-cyan)), transparent);
+            }
+            .stat-header {
+                font-size: 2.2rem;
+                font-weight: 700;
+                letter-spacing: -0.02em;
+                color: var(--text-primary);
+                font-family: 'JetBrains Mono', monospace;
+            }
+            .stat-title {
+                color: var(--text-secondary);
+                font-size: 0.82rem;
+                font-weight: 600;
+                text-transform: uppercase;
+                letter-spacing: 0.08em;
+                margin-bottom: 0.5rem;
+            }
+
+            .section-title {
+                font-size: 1.15rem;
+                font-weight: 700;
+                color: var(--text-primary);
+                letter-spacing: -0.01em;
+            }
+
+            .table-custom {
+                background: transparent !important;
+                color: var(--text-primary) !important;
+                margin-bottom: 0;
+            }
+            .table-custom th {
+                background-color: rgba(15, 23, 42, 0.8) !important;
+                color: var(--text-secondary) !important;
+                font-size: 0.82rem !important;
+                font-weight: 600 !important;
+                text-transform: uppercase !important;
+                letter-spacing: 0.06em !important;
+                padding: 1rem 1.2rem !important;
+                border-bottom: 1px solid var(--border-color) !important;
+            }
+            .table-custom td {
+                padding: 1rem 1.2rem !important;
+                border-bottom: 1px solid rgba(30, 41, 59, 0.6) !important;
+                vertical-align: middle !important;
+                background: transparent !important;
+                color: var(--text-primary) !important;
+            }
+            .table-custom tbody tr:hover td {
+                background-color: rgba(30, 41, 59, 0.4) !important;
+            }
+
+            .font-mono {
+                font-family: 'JetBrains Mono', monospace;
+            }
+
             .key-box {
-                background-color: #0d1117;
-                border: 1px solid #30363d;
-                border-radius: 6px;
+                background-color: #060911;
+                border: 1px solid var(--border-color);
+                border-radius: 8px;
                 padding: 10px 14px;
-                font-family: monospace;
+                font-family: 'JetBrains Mono', monospace;
                 word-break: break-all;
+                color: var(--accent-cyan);
             }
+
+            .solved-banner {
+                background: linear-gradient(135deg, rgba(34, 197, 94, 0.15) 0%, rgba(10, 15, 26, 0.95) 100%);
+                border: 2px solid var(--accent-green);
+                box-shadow: 0 0 35px rgba(34, 197, 94, 0.25);
+                border-radius: 16px;
+            }
+
+            .badge-glow-cyan {
+                background: rgba(56, 189, 248, 0.12);
+                color: var(--accent-cyan);
+                border: 1px solid rgba(56, 189, 248, 0.3);
+            }
+            .badge-glow-green {
+                background: rgba(34, 197, 94, 0.12);
+                color: var(--accent-green);
+                border: 1px solid rgba(34, 197, 94, 0.3);
+            }
+            .badge-glow-amber {
+                background: rgba(245, 158, 11, 0.12);
+                color: var(--accent-amber);
+                border: 1px solid rgba(245, 158, 11, 0.3);
+            }
+            .badge-glow-purple {
+                background: rgba(168, 85, 247, 0.12);
+                color: var(--accent-purple);
+                border: 1px solid rgba(168, 85, 247, 0.3);
+            }
+
+            .pulse-dot {
+                width: 8px;
+                height: 8px;
+                background-color: var(--accent-green);
+                border-radius: 50%;
+                display: inline-block;
+                box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+                animation: pulse-green 2s infinite;
+            }
+            @keyframes pulse-green {
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
+                70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+            }
+
             @media (max-width: 768px) {
                 body { padding: 0.75rem !important; }
                 .stat-header { font-size: 1.6rem; }
-                .card { padding: 1rem !important; }
-                .btn-sm { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
             }
         </style>
     </head>
-    <body class="p-4">
-        <div class="container-fluid p-2 p-md-4">
-            <!-- Header -->
-            <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3 mb-4 pb-2 border-bottom border-secondary">
-                <div class="d-flex align-items-center flex-wrap gap-2">
-                    <h2 class="mb-0 fs-3 fw-bold">🦘 RCKangaroo Pool Coordinator</h2>
-                    <span class="badge bg-success">Autenticado</span>
+    <body class="p-3 p-md-4">
+        <div class="container-fluid max-w-7xl mx-auto">
+
+            <!-- Top Header -->
+            <div class="glass-card p-3 p-md-4 mb-4 d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3">
+                <div class="d-flex align-items-center gap-3">
+                    <div class="fs-2">🦘</div>
+                    <div>
+                        <div class="d-flex align-items-center gap-2">
+                            <h1 class="h4 mb-0 fw-bold tracking-tight">RCKangaroo Pool Coordinator</h1>
+                            <span class="badge badge-glow-green px-2.5 py-1 rounded-pill fs-7 font-semibold">
+                                <span class="pulse-dot me-1"></span> Autenticado
+                            </span>
+                        </div>
+                        <span class="text-secondary fs-7">Coordenador Distribuído de Alta Performance — Bitcoin Puzzles</span>
+                    </div>
                 </div>
                 <div class="d-flex flex-wrap gap-2">
-                    <button class="btn btn-outline-info btn-sm fw-bold" onclick="openCoverageModal()">📄 Ver Relatório (COVERAGE.TXT)</button>
-                    <button class="btn btn-outline-danger btn-sm" onclick="clearOldJobs()">🗑️ Limpar Jobs / Testes</button>
-                    <button class="btn btn-outline-primary btn-sm" onclick="loadStats()">🔄 Atualizar</button>
+                    <button class="btn btn-outline-info btn-sm fw-medium rounded-3 px-3" onclick="openCoverageModal()">
+                        📄 Ver Relatório (COVERAGE.TXT)
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm rounded-3 px-3" onclick="clearOldJobs()">
+                        🗑️ Limpar Jobs
+                    </button>
+                    <button class="btn btn-primary btn-sm rounded-3 px-3 fw-semibold bg-blue-600 border-0" onclick="loadStats()">
+                        🔄 Atualizar
+                    </button>
                 </div>
             </div>
 
             <!-- Solved Alert Banner -->
             <div id="solved-solutions-container" class="mb-4"></div>
 
-            <!-- Stats Row -->
+            <!-- 4 Main Stat Cards -->
             <div class="row g-3 mb-4">
-                <div class="col-12 col-md-4">
-                    <div class="card p-3 text-center">
-                        <div class="stat-sub">HASHRATE TOTAL DA POOL</div>
-                        <div class="stat-header" id="pool-hashrate">0.00 GH/s</div>
+                <div class="col-12 col-sm-6 col-xl-3">
+                    <div class="glass-card stat-card" style="--accent-color: var(--accent-cyan);">
+                        <div class="stat-title">HASHRATE TOTAL DA POOL</div>
+                        <div class="stat-header text-info" id="pool-hashrate">0.00 GH/s</div>
+                        <div class="fs-7 text-secondary mt-1">Velocidade combinada dos workers</div>
                     </div>
                 </div>
-                <div class="col-12 col-md-4">
-                    <div class="card p-3 text-center">
-                        <div class="stat-sub">WORKERS ATIVOS NO MOMENTO</div>
-                        <div class="stat-header text-info" id="active-workers">0</div>
+                <div class="col-12 col-sm-6 col-xl-3">
+                    <div class="glass-card stat-card" style="--accent-color: var(--accent-green);">
+                        <div class="stat-title">WORKERS ATIVOS NO MOMENTO</div>
+                        <div class="stat-header text-success" id="active-workers">0</div>
+                        <div class="fs-7 text-secondary mt-1">GPUs conectadas à pool</div>
                     </div>
                 </div>
-                <div class="col-12 col-md-4">
-                    <div class="card p-3 text-center">
-                        <div class="stat-sub">JOBS ATIVOS</div>
-                        <div class="stat-header text-warning" id="total-jobs">0</div>
+                <div class="col-12 col-sm-6 col-xl-3">
+                    <div class="glass-card stat-card" style="--accent-color: var(--accent-amber);">
+                        <div class="stat-title">CHAVES TESTADAS</div>
+                        <div class="stat-header text-warning fs-3" id="keys-tested">0 Zetakeys</div>
+                        <div class="fs-7 text-secondary mt-1">Soma acumulada de todas as chaves</div>
+                    </div>
+                </div>
+                <div class="col-12 col-sm-6 col-xl-3">
+                    <div class="glass-card stat-card" style="--accent-color: var(--accent-purple);">
+                        <div class="stat-title">CHUNKS CONCLUÍDOS</div>
+                        <div class="stat-header text-purple fs-3" style="color: #c084fc;" id="completed-chunks">0</div>
+                        <div class="fs-7 text-secondary mt-1">Sub-blocos validados com sucesso</div>
                     </div>
                 </div>
             </div>
 
-            <!-- Active Target Puzzle Detailed Card -->
+            <!-- Active Target Puzzle Card -->
             <div id="active-target-puzzle-container" class="mb-4"></div>
 
             <!-- Active Workers & Live Ranges Table -->
-            <div class="card p-3 mb-4">
-                <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-2">
-                    <h5 class="mb-0 fw-bold">💻 Workers Ativos & Faixa Atual que Cada um Começou</h5>
-                    <span class="badge bg-info">Desaparecem Automaticamente se Pararem</span>
+            <div class="glass-card p-3 p-md-4 mb-4">
+                <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
+                    <div>
+                        <h2 class="section-title mb-0">💻 Workers Ativos & Faixas Atribuídas</h2>
+                        <span class="text-secondary fs-7">Lista em tempo real das GPUs trabalhando agora</span>
+                    </div>
+                    <span class="badge badge-glow-cyan px-3 py-1.5 rounded-pill fs-7">
+                        Atualização Automática (3s)
+                    </span>
                 </div>
-                <div class="table-responsive mt-2">
-                    <table class="table table-dark table-hover align-middle mb-0">
+                <div class="table-responsive">
+                    <table class="table table-custom align-middle">
                         <thead>
                             <tr>
                                 <th>Worker ID / Nome</th>
@@ -1025,23 +1208,28 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             </div>
 
             <!-- Active Target Jobs Overview -->
-            <div class="card p-3">
-                <div class="d-flex justify-content-between align-items-center mb-2">
-                    <h5 class="mb-0">📋 Jobs de Busca</h5>
-                    <button class="btn btn-outline-danger btn-sm" onclick="clearOldJobs()">🗑️ Limpar Todos os Jobs</button>
+            <div class="glass-card p-3 p-md-4">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <div>
+                        <h2 class="section-title mb-0">📋 Jobs de Busca Cadastrados</h2>
+                        <span class="text-secondary fs-7">Gerenciamento de intervalos ativos e resolvidos</span>
+                    </div>
+                    <button class="btn btn-outline-danger btn-sm rounded-3" onclick="clearOldJobs()">
+                        🗑️ Limpar Todos os Jobs
+                    </button>
                 </div>
-                <div class="table-responsive mt-2">
-                    <table class="table table-dark table-hover align-middle">
+                <div class="table-responsive">
+                    <table class="table table-custom align-middle">
                         <thead>
                             <tr>
                                 <th>Puzzle / Job ID</th>
                                 <th>Endereço BTC Alvo</th>
-                                <th>Chave Pública Alvo (Public Key)</th>
+                                <th>Chave Pública Alvo</th>
                                 <th>Faixa Executada (%)</th>
                                 <th>Start Offset Hex</th>
                                 <th>Range</th>
                                 <th>Status</th>
-                                <th>Ações / Resultado</th>
+                                <th>Ações</th>
                             </tr>
                         </thead>
                         <tbody id="jobs-table-body">
@@ -1083,31 +1271,6 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 }
             }
 
-            function onPuzzleSelectChange() {
-                const val = document.getElementById('puzzle_select').value;
-                const customDiv = document.getElementById('custom-fields');
-                if (val === 'custom') {
-                    customDiv.classList.remove('d-none');
-                } else {
-                    customDiv.classList.add('d-none');
-                }
-                updateCalculatedHexPreview();
-            }
-
-            function updateCalculatedHexPreview() {
-                const val = document.getElementById('puzzle_select').value;
-                const startPct = parseFloat(document.getElementById('start_pct').value) || 0.0;
-                const endPct = parseFloat(document.getElementById('end_pct').value) || 100.0;
-                const previewEl = document.getElementById('preview-hex-info');
-
-                if (presets[val]) {
-                    const p = presets[val];
-                    previewEl.innerHTML = `Puzzle #${val} (${p.bits} bits) | Endereço BTC: <strong class="text-warning">${p.btc_address}</strong> | Pubkey: <code>${p.pubkey.substring(0, 16)}...</code> | Intervalo: <strong>${startPct}% → ${endPct}%</strong>`;
-                } else {
-                    previewEl.innerHTML = `Modo Customizado | Intervalo: <strong>${startPct}% → ${endPct}%</strong>`;
-                }
-            }
-
             async function loadStats() {
                 try {
                     const res = await fetch('/api/stats');
@@ -1119,7 +1282,8 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
                     document.getElementById('pool-hashrate').innerText = data.total_pool_hashrate_ghs + ' GH/s';
                     document.getElementById('active-workers').innerText = data.active_workers_count;
-                    document.getElementById('total-jobs').innerText = data.jobs.length;
+                    document.getElementById('keys-tested').innerText = data.keys_zetta_str || '0 Zetakeys';
+                    document.getElementById('completed-chunks').innerText = (data.total_completed_chunks || 0).toLocaleString();
 
                     // Solved Banner
                     const solvedContainer = document.getElementById('solved-solutions-container');
@@ -1127,33 +1291,33 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
                     if (solvedJobs.length > 0) {
                         solvedContainer.innerHTML = solvedJobs.map(sj => `
-                            <div class="card solved-banner p-4 mb-3">
+                            <div class="glass-card solved-banner p-4 mb-3">
                                 <div class="d-flex justify-content-between align-items-center mb-3">
-                                    <h3 class="text-success fw-bold mb-0">🎉 CHAVE PRIVADA ENCONTRADA!</h3>
+                                    <h3 class="text-success fw-bold mb-0 fs-4">🎉 CHAVE PRIVADA ENCONTRADA!</h3>
                                     <div>
-                                        <span class="badge bg-success fs-6 me-2">${sj.solved_at_str || 'Recente'}</span>
-                                        <button class="btn btn-outline-danger btn-sm fw-bold" onclick="deleteSingleJob('${sj.job_id}')">🗑️ Apagar Este Resultado</button>
+                                        <span class="badge badge-glow-green fs-6 me-2">${sj.solved_at_str || 'Recente'}</span>
+                                        <button class="btn btn-outline-danger btn-sm font-semibold" onclick="deleteSingleJob('${sj.job_id}')">🗑️ Apagar Este Resultado</button>
                                     </div>
                                 </div>
                                 <div class="row g-3">
                                     <div class="col-md-6">
-                                        <div class="stat-sub">PUBKEY ALVO:</div>
+                                        <div class="stat-title">PUBKEY ALVO:</div>
                                         <div class="key-box text-info">${sj.pubkey}</div>
                                     </div>
                                     <div class="col-md-6">
-                                        <div class="stat-sub">ENCONTRADA POR WORKER:</div>
+                                        <div class="stat-title">ENCONTRADA POR WORKER:</div>
                                         <div class="key-box text-warning">${sj.solved_by || 'Desconhecido'}</div>
                                     </div>
                                     <div class="col-md-12">
                                         <div class="d-flex justify-content-between align-items-center mb-1">
-                                            <div class="stat-sub">CHAVE PRIVADA (HEX):</div>
+                                            <div class="stat-title">CHAVE PRIVADA (HEX):</div>
                                             <button class="btn btn-sm btn-outline-success" onclick="copyText('${sj.private_key_hex}')">📋 Copiar HEX</button>
                                         </div>
                                         <div class="key-box text-success fw-bold fs-5">${sj.private_key_hex}</div>
                                     </div>
                                     <div class="col-md-12">
                                         <div class="d-flex justify-content-between align-items-center mb-1">
-                                            <div class="stat-sub">CHAVE PRIVADA (FORMATO WIF COMPRESSADO):</div>
+                                            <div class="stat-title">CHAVE PRIVADA (FORMATO WIF COMPRESSADO):</div>
                                             <button class="btn btn-sm btn-outline-success" onclick="copyText('${sj.wif_compressed}')">📋 Copiar WIF</button>
                                         </div>
                                         <div class="key-box text-warning fw-bold fs-5">${sj.wif_compressed}</div>
@@ -1168,29 +1332,29 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     // Render Active Workers & Their Live Started Ranges
                     const workersBody = document.getElementById('workers-table-body');
                     if (data.workers.length === 0) {
-                        workersBody.innerHTML = `<tr><td colspan="7" class="text-center text-muted p-4">Nenhum worker ativo no momento. Ao conectar um worker (local/Vast.ai), a faixa dele aparecerá aqui automaticamente. Se o worker parar, ele é removido da lista.</td></tr>`;
+                        workersBody.innerHTML = `<tr><td colspan="7" class="text-center text-secondary p-4">Nenhum worker ativo no momento. Ao conectar um worker (local/Vast.ai), a faixa dele aparecerá aqui automaticamente.</td></tr>`;
                     } else {
                         workersBody.innerHTML = data.workers.map(w => {
                             const hrStr = w.hashrate_mhs >= 1000 ? (w.hashrate_mhs / 1000.0).toFixed(2) + ' GH/s' : w.hashrate_mhs.toFixed(2) + ' MH/s';
                             const chunksBadge = w.completed_chunks > 0 ?
-                                `<span class="badge bg-success fs-7 px-3 py-1 fw-bold">${w.completed_chunks} chunks</span>` :
-                                `<span class="badge bg-dark border border-secondary text-muted fs-7 px-2 py-1">${w.completed_chunks} chunks</span>`;
-                            const rangeBadge = `<span class="badge bg-gradient bg-primary fs-6 px-3 py-2 border border-info shadow-sm" style="font-size: 0.92rem !important; letter-spacing: 0.5px;">${w.assigned_range || '0% → 100%'}</span>`;
-                            const hexBadge = `<span class="badge bg-black border border-info text-info fs-7 px-2 py-1 font-monospace">${w.current_start_hex || 'Iniciando...'}</span>`;
+                                `<span class="badge badge-glow-green px-3 py-1 fw-bold">${w.completed_chunks} chunks</span>` :
+                                `<span class="badge bg-dark text-secondary px-2 py-1">${w.completed_chunks} chunks</span>`;
+                            const rangeBadge = `<span class="badge badge-glow-cyan font-mono px-3 py-1.5 fw-semibold" style="font-size: 0.9rem;">${w.assigned_range || '0% → 100%'}</span>`;
+                            const hexBadge = `<span class="badge bg-black border border-secondary text-info font-mono px-2 py-1">${w.current_start_hex || 'Iniciando...'}</span>`;
                             const pingSecs = Math.max(0, Math.round(Date.now()/1000 - w.last_ping));
                             
                             return `
                             <tr>
                                 <td>
                                     <strong class="text-light fs-6">${w.name}</strong><br>
-                                    <code class="text-muted fs-7">${w.worker_id}</code>
+                                    <code class="text-secondary fs-7 font-mono">${w.worker_id}</code>
                                 </td>
                                 <td><span class="text-secondary fs-7">${w.gpu_info}</span></td>
-                                <td style="color: #58a6ff; font-weight: bold; font-size: 1.05rem;">${hrStr}</td>
+                                <td style="color: var(--accent-cyan); font-weight: 700; font-family: 'JetBrains Mono', monospace;">${hrStr}</td>
                                 <td>${rangeBadge}</td>
                                 <td>${hexBadge}</td>
                                 <td>${chunksBadge}</td>
-                                <td><span class="badge bg-success-subtle text-success border border-success px-2 py-1 fs-7">🟢 Ativo (${pingSecs}s atrás)</span></td>
+                                <td><span class="badge badge-glow-green px-2.5 py-1 fs-7">🟢 Ativo (${pingSecs}s atrás)</span></td>
                             </tr>
                             `;
                         }).join('');
@@ -1206,38 +1370,37 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         const totalCompleted = activeJobs.reduce((acc, j) => acc + (j.completed_chunks || 0), 0);
                         const minStart = Math.min(...activeJobs.map(j => j.start_percent));
                         const maxEnd = Math.max(...activeJobs.map(j => j.end_percent));
-                        const rangeBadges = activeJobs.map(j => `<span class="badge bg-primary fs-7 me-1 mb-1" title="Job ${j.job_id}">${j.start_percent.toFixed(1)}% → ${j.end_percent.toFixed(1)}%</span>`).join('');
+                        const rangeBadges = activeJobs.map(j => `<span class="badge badge-glow-cyan font-mono me-1 mb-1" title="Job ${j.job_id}">${j.start_percent.toFixed(1)}% → ${j.end_percent.toFixed(1)}%</span>`).join('');
 
                         targetContainer.innerHTML = `
-                            <div class="card p-4 border border-info shadow-sm">
+                            <div class="glass-card p-4 border border-info">
                                 <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
                                     <div class="d-flex align-items-center">
-                                        <span class="fs-4 me-2">🎯</span>
-                                        <h4 class="mb-0 text-info fw-bold">${firstActive.puzzle_name}</h4>
-                                        <span class="badge bg-success ms-3 fs-6">Em Busca Ativa (${activeJobs.length} Jobs Simultâneos)</span>
+                                        <span class="fs-3 me-2">🎯</span>
+                                        <h3 class="mb-0 text-info fw-bold h4">${firstActive.puzzle_name}</h3>
+                                        <span class="badge badge-glow-green ms-3 fs-7">Em Busca Ativa (${activeJobs.length} Jobs Simultâneos)</span>
                                     </div>
                                     <div class="d-flex flex-wrap align-items-center gap-2">
-                                        <span class="badge bg-dark border border-secondary text-light fs-6">Range Total: ${minStart.toFixed(1)}% → ${maxEnd.toFixed(1)}%</span>
-                                        <span class="badge bg-secondary fs-6">Chunks Atribuídos Total: ${totalAssigned}</span>
-                                        <span class="badge bg-success fs-6">Chunks Concluídos Total: ${totalCompleted}</span>
+                                        <span class="badge bg-black border border-secondary text-light fs-7 font-mono">Range Total: ${minStart.toFixed(1)}% → ${maxEnd.toFixed(1)}%</span>
+                                        <span class="badge badge-glow-purple fs-7">Chunks Concluídos: ${totalCompleted} / ${totalAssigned}</span>
                                     </div>
                                 </div>
                                 <div class="mb-3">
-                                    <span class="stat-sub me-2">FAIXAS ATIVAS EM PROCESSAMENTO:</span>
+                                    <span class="stat-title me-2">FAIXAS ATIVAS EM PROCESSAMENTO:</span>
                                     <div class="d-inline-flex flex-wrap mt-1">${rangeBadges}</div>
                                 </div>
                                 <div class="row g-3">
                                     <div class="col-md-6">
-                                        <div class="stat-sub">CHAVE PÚBLICA ALVO (PUBLIC KEY):</div>
+                                        <div class="stat-title">CHAVE PÚBLICA ALVO (PUBLIC KEY):</div>
                                         <div class="d-flex align-items-center mt-1">
-                                            <div class="key-box text-info flex-grow-1 me-2" style="font-size: 0.88rem;">${firstActive.pubkey}</div>
+                                            <div class="key-box text-info flex-grow-1 me-2 fs-7">${firstActive.pubkey}</div>
                                             <button class="btn btn-sm btn-outline-info" onclick="copyText('${firstActive.pubkey}')">📋 Copiar</button>
                                         </div>
                                     </div>
                                     <div class="col-md-6">
-                                        <div class="stat-sub">ENDEREÇO BITCOIN ALVO (CORRESPONDENTE):</div>
+                                        <div class="stat-title">ENDEREÇO BITCOIN ALVO:</div>
                                         <div class="d-flex align-items-center mt-1">
-                                            <div class="key-box text-warning flex-grow-1 me-2" style="font-size: 0.95rem; font-weight: bold;">${firstActive.btc_address}</div>
+                                            <div class="key-box text-warning flex-grow-1 me-2 fs-7 font-semibold" style="color: var(--accent-amber);">${firstActive.btc_address}</div>
                                             <button class="btn btn-sm btn-outline-warning" onclick="copyText('${firstActive.btc_address}')">📋 Copiar</button>
                                         </div>
                                     </div>
@@ -1251,34 +1414,34 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     // Render Jobs Table
                     const jobsBody = document.getElementById('jobs-table-body');
                     if (data.jobs.length === 0) {
-                        jobsBody.innerHTML = `<tr><td colspan="8" class="text-center text-muted p-3">Nenhum job no momento.</td></tr>`;
+                        jobsBody.innerHTML = `<tr><td colspan="8" class="text-center text-secondary p-3">Nenhum job cadastrado no momento.</td></tr>`;
                     } else {
                         jobsBody.innerHTML = data.jobs.map(j => `
                             <tr>
                                 <td>
                                     <strong class="text-info">${j.puzzle_name}</strong><br>
-                                    <code class="text-muted fs-7">${j.job_id}</code>
+                                    <code class="text-secondary fs-7 font-mono">${j.job_id}</code>
                                 </td>
                                 <td>
-                                    <span class="text-warning fw-bold">${j.btc_address}</span>
+                                    <span class="text-warning fw-semibold font-mono">${j.btc_address}</span>
                                     <button class="btn btn-sm btn-link text-warning p-0 ms-1" onclick="copyText('${j.btc_address}')" title="Copiar Endereço">📋</button>
                                 </td>
                                 <td>
-                                    <code class="text-truncate d-inline-block" style="max-width: 180px;" title="${j.pubkey}">${j.pubkey}</code>
+                                    <code class="text-truncate d-inline-block font-mono text-secondary" style="max-width: 180px;" title="${j.pubkey}">${j.pubkey}</code>
                                 </td>
-                                <td><span class="badge bg-secondary fs-7">${j.start_percent}% → ${j.end_percent}%</span></td>
-                                <td><code>0x${j.start_hex}</code></td>
+                                <td><span class="badge badge-glow-cyan font-mono">${j.start_percent}% → ${j.end_percent}%</span></td>
+                                <td><code class="font-mono text-secondary">0x${j.start_hex}</code></td>
                                 <td>
-                                    ${j.range_bits} bits<br>
-                                    <span class="badge bg-dark border border-secondary text-info fs-7" title="Chunks Concluídos / Atribuídos">${j.completed_chunks} / ${j.total_chunks_assigned} chunks</span>
+                                    <span class="font-mono">${j.range_bits} bits</span><br>
+                                    <span class="badge badge-glow-purple fs-7 font-mono">${j.completed_chunks} / ${j.total_chunks_assigned} chunks</span>
                                 </td>
-                                <td><span class="badge ${j.status === 'SOLVED' ? 'bg-success' : 'bg-primary'}">${j.status}</span></td>
-                                <td style="font-family: monospace;">
+                                <td><span class="badge ${j.status === 'SOLVED' ? 'badge-glow-green' : 'badge-glow-cyan'}">${j.status}</span></td>
+                                <td class="font-mono">
                                     ${j.status === 'SOLVED' ? `
                                         <button class="btn btn-sm btn-outline-danger me-2" onclick="deleteSingleJob('${j.job_id}')">🗑️ Apagar</button>
-                                        <span class="text-success fw-bold">${j.private_key_hex}</span>
+                                        <span class="text-success font-semibold">${j.private_key_hex}</span>
                                     ` : `
-                                        <button class="btn btn-sm btn-outline-danger" onclick="deleteSingleJob('${j.job_id}')">🗑️ Cancelar / Apagar</button>
+                                        <button class="btn btn-sm btn-outline-danger" onclick="deleteSingleJob('${j.job_id}')">🗑️ Apagar</button>
                                     `}
                                 </td>
                             </tr>
@@ -1309,16 +1472,16 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
         <!-- Coverage Report Modal -->
         <div class="modal fade" id="coverageModal" tabindex="-1" aria-hidden="true">
             <div class="modal-dialog modal-lg modal-dialog-centered">
-                <div class="modal-content bg-dark text-light border border-info shadow-lg">
+                <div class="modal-content glass-card border border-info shadow-lg">
                     <div class="modal-header border-secondary">
-                        <h5 class="modal-title text-info fw-bold">📄 Relatório de Cobertura & Anti-Sobreposição (COVERAGE.TXT)</h5>
+                        <h5 class="modal-title text-info font-semibold">📄 Relatório de Cobertura & Anti-Sobreposição (COVERAGE.TXT)</h5>
                         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                     </div>
                     <div class="modal-body">
                         <div class="mb-3">
-                            <span class="text-muted fs-7">Este relatório é gerado automaticamente e salvo na VPS (`/opt/rckangaroo/pool/server/COVERAGE.TXT`) para evitar retrabalho e mostrar exatamente quais faixas estão <strong>livres e recomendadas</strong> para novos Workers:</span>
+                            <span class="text-secondary fs-7">Este relatório é gerado automaticamente na VPS (`/opt/rckangaroo/pool/server/COVERAGE.TXT`) para evitar retrabalho e mostrar faixas livres:</span>
                         </div>
-                        <pre id="coverage-report-content" class="bg-black text-success p-3 rounded border border-secondary" style="font-family: monospace; white-space: pre-wrap; font-size: 0.88rem; max-height: 400px; overflow-y: auto;"></pre>
+                        <pre id="coverage-report-content" class="bg-black text-success p-3 rounded-3 border border-secondary font-mono" style="white-space: pre-wrap; font-size: 0.88rem; max-height: 400px; overflow-y: auto;"></pre>
                     </div>
                     <div class="modal-footer border-secondary">
                         <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Fechar</button>
@@ -1327,10 +1490,11 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 </div>
             </div>
         </div>
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
     </body>
     </html>
     """
+    return HTMLResponse(content=html_content)
     return HTMLResponse(content=html_content)
 
 if __name__ == "__main__":
