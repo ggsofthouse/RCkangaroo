@@ -800,7 +800,8 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
                         pass
 
                 if req.worker_id:
-                    cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
+                    w_name = req.name or req.worker_id
+                    cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ? OR name = ?", (job_id, req.worker_id, w_name))
                 conn.commit()
                 conn.close()
                 return {"status": "EXISTS", "job_id": job_id}
@@ -816,7 +817,8 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
         conn = get_db()
         cursor = conn.cursor()
         if req.worker_id:
-            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
+            w_name = req.name or req.worker_id
+            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ? OR name = ?", (job_id, req.worker_id, w_name))
             conn.commit()
         conn.close()
     return {"status": "AUTO_CREATED", "job_id": job_id}
@@ -872,19 +874,36 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         """, (req.worker_id,))
         job = cursor.fetchone()
 
-        # 2. Secondary lookup: recent job chunks for this worker
+        # 2. Secondary lookup: match by worker name (e.g. Vast-2x-A2)
+        if not job and req.name:
+            cursor.execute("""
+                SELECT j.* FROM jobs j 
+                JOIN workers w ON w.current_job_id = j.job_id 
+                WHERE w.name = ? AND j.status = 'ACTIVE' AND w.current_job_id IS NOT NULL
+                ORDER BY w.last_ping DESC LIMIT 1
+            """, (req.name,))
+            job = cursor.fetchone()
+
+        # 3. Tertiary lookup: recent job chunks for this worker
         if not job:
             cursor.execute("""
                 SELECT j.* FROM chunks c
                 JOIN jobs j ON c.job_id = j.job_id
-                WHERE c.assigned_worker = ? AND j.status = 'ACTIVE'
+                WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?) AND j.status = 'ACTIVE'
                 ORDER BY c.assigned_at DESC LIMIT 1
-            """, (req.worker_id,))
+            """, (req.worker_id, f"{req.name}%" if req.name else req.worker_id))
             job = cursor.fetchone()
 
-        # 3. Fallback: latest active job
+        # 4. Balanced Fallback: active job with least assigned chunks
         if not job:
-            cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
+            cursor.execute("""
+                SELECT j.*, COUNT(c.chunk_id) as cnt FROM jobs j 
+                LEFT JOIN chunks c ON c.job_id = j.job_id AND c.status = 'ASSIGNED' 
+                WHERE j.status = 'ACTIVE' 
+                GROUP BY j.job_id 
+                ORDER BY cnt ASC, j.created_at ASC 
+                LIMIT 1
+            """)
             job = cursor.fetchone()
 
         if not job:
@@ -892,7 +911,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             return {"status": "NO_WORK", "message": "No active jobs available"}
 
         # Link worker to this active job
-        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job['job_id'], req.worker_id))
+        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ? OR name = ?", (job['job_id'], req.worker_id, req.name or req.worker_id))
 
         current_offset_int = int(job['current_offset_hex'], 16)
         chunk_bits = min(job['chunk_bits'], job['range_bits'])
