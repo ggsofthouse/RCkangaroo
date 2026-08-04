@@ -21,6 +21,30 @@ def download_worker_script():
     return FileResponse(worker_file, media_type="text/x-python", filename="worker.py")
 
 
+TAMES_DIR = os.path.join(os.path.dirname(__file__), "tames")
+os.makedirs(TAMES_DIR, exist_ok=True)
+
+@app.get("/tames/{filename}")
+def download_tame_file(filename: str):
+    safe_filename = os.path.basename(filename)
+    filepath = os.path.join(TAMES_DIR, safe_filename)
+    if not os.path.exists(filepath):
+        raise HTTPException(status_code=404, detail="Tame file not found")
+    return FileResponse(filepath, media_type="application/octet-stream", filename=safe_filename)
+
+@app.get("/api/tames/check/{puzzle_number}")
+def check_tame_file(puzzle_number: int):
+    filename = f"tames{puzzle_number}.dat"
+    filepath = os.path.join(TAMES_DIR, filename)
+    exists = os.path.exists(filepath)
+    size_bytes = os.path.getsize(filepath) if exists else 0
+    return {
+        "exists": exists,
+        "filename": filename if exists else None,
+        "download_url": f"/tames/{filename}" if exists else None,
+        "size_mb": round(size_bytes / (1024 * 1024), 2) if exists else 0
+    }
+
 # CORS restrito ao domínio configurado na VPS
 _ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")
 app.add_middleware(

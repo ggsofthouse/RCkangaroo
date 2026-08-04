@@ -178,7 +178,44 @@ def http_post(endpoint: str, payload: dict) -> dict:
         print(f"\u274c HTTP Error connecting to pool server ({url}): {e}")
         return {}
 
+def http_get(endpoint: str) -> dict:
+    url = urllib.parse.urljoin(SERVER_URL, endpoint)
+    req = urllib.request.Request(
+        url,
+        headers={
+            'X-Worker-Token': WORKER_TOKEN
+        }
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode('utf-8'))
+    except Exception:
+        return {}
 
+def ensure_tames_file(puzzle_number: int, bin_dir: str) -> Optional[str]:
+    """Verifica se o servidor da pool possui arquivo de tames pré-gerado para este puzzle.
+    Se sim, baixa para o diretório do binário RCKangaroo.
+    """
+    try:
+        tame_info = http_get(f"/api/tames/check/{puzzle_number}")
+        if tame_info and tame_info.get("exists"):
+            filename = tame_info["filename"]
+            download_url = tame_info["download_url"]
+            local_path = os.path.join(bin_dir, filename)
+            
+            if not os.path.exists(local_path) or os.path.getsize(local_path) == 0:
+                print(f"🦘 Baixando tames pré-gerados ({tame_info.get('size_mb', 0)} MB) da Pool...")
+                full_url = urllib.parse.urljoin(SERVER_URL, download_url)
+                req = urllib.request.Request(full_url, headers={"X-Worker-Token": WORKER_TOKEN})
+                with urllib.request.urlopen(req, timeout=180) as resp, open(local_path, "wb") as f:
+                    f.write(resp.read())
+                print(f"✅ Tames baixados com sucesso: {filename}")
+            else:
+                print(f"🦘 Usando tames pré-gerados locais: {filename}")
+            return filename
+    except Exception as e:
+        print(f"ℹ️ Conectado sem tames pré-gerados para Puzzle #{puzzle_number} (rodando no modo normal)")
+    return None
 
 def get_binary_path() -> str:
     system = platform.system()
@@ -316,6 +353,9 @@ def main():
                     except Exception:
                         pass
 
+                # Check and download pre-generated tames file if available on pool server
+                tame_file = ensure_tames_file(TARGET_PUZZLE, os.path.dirname(bin_path))
+
                 # Build executable command line
                 cmd = [
                     bin_path,
@@ -326,6 +366,8 @@ def main():
                     "-pubkey", pubkey,
                     "-max", str(max_ops)
                 ]
+                if tame_file:
+                    cmd.extend(["-tames", tame_file])
 
 
                 print(f"   Executando: {' '.join(cmd)}")
