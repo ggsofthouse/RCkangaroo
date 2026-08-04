@@ -187,8 +187,7 @@ def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
         return False
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout = 30000;")
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -636,22 +635,24 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE assigned_worker = ? AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'],))
             w_dict['completed_chunks'] = cursor.fetchone()['cnt']
             
-            # Prioriza a faixa do chunk ativo que o worker está processando
-            cursor.execute("""
-                SELECT j.start_percent, j.end_percent FROM chunks c 
-                JOIN jobs j ON c.job_id = j.job_id 
-                WHERE c.assigned_worker = ? ORDER BY c.assigned_at DESC LIMIT 1
-            """, (w_dict['worker_id'],))
-            cj = cursor.fetchone()
-            
-            if not cj and w_dict.get('current_job_id'):
+            if w_dict.get('current_job_id'):
                 cursor.execute("SELECT start_percent, end_percent FROM jobs WHERE job_id = ?", (w_dict['current_job_id'],))
                 cj = cursor.fetchone()
-
-            if cj:
-                w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
+                if cj:
+                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
+                else:
+                    w_dict['assigned_range'] = "0% → 100%"
             else:
-                w_dict['assigned_range'] = "0% → 100%"
+                cursor.execute("""
+                    SELECT j.start_percent, j.end_percent FROM chunks c 
+                    JOIN jobs j ON c.job_id = j.job_id 
+                    WHERE c.assigned_worker = ? ORDER BY c.assigned_at DESC LIMIT 1
+                """, (w_dict['worker_id'],))
+                cj = cursor.fetchone()
+                if cj:
+                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
+                else:
+                    w_dict['assigned_range'] = "0% → 100%"
 
             workers.append(w_dict)
             
@@ -693,8 +694,11 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                     j_dict['solved_at_str'] = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(j_dict['solved_at']))
             jobs.append(j_dict)
 
+        conn.close()
+
         # Calcula soma real de chaves e total de chunks concluidos
         total_completed_chunks = sum(j['completed_chunks'] for j in jobs)
+        cursor = get_db().cursor()
         cursor.execute("SELECT range_bits FROM chunks WHERE status IN ('COMPLETED', 'SOLVED')")
         rows = cursor.fetchall()
         keys_tested = sum(2**int(r[0]) for r in rows)
@@ -735,8 +739,6 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 h = up_sec // 3600
                 m = (up_sec % 3600) // 60
                 active_job_uptime = f"{h}h {m}m"
-
-        conn.close()
 
         return {
             "active_workers_count": len(workers),
@@ -800,8 +802,7 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
                         pass
 
                 if req.worker_id:
-                    w_name = req.name or req.worker_id
-                    cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ? OR name = ?", (job_id, req.worker_id, w_name))
+                    cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
                 conn.commit()
                 conn.close()
                 return {"status": "EXISTS", "job_id": job_id}
@@ -817,8 +818,7 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
         conn = get_db()
         cursor = conn.cursor()
         if req.worker_id:
-            w_name = req.name or req.worker_id
-            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ? OR name = ?", (job_id, req.worker_id, w_name))
+            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job_id, req.worker_id))
             conn.commit()
         conn.close()
     return {"status": "AUTO_CREATED", "job_id": job_id}
@@ -874,36 +874,19 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         """, (req.worker_id,))
         job = cursor.fetchone()
 
-        # 2. Secondary lookup: match by worker name (e.g. Vast-2x-A2)
-        if not job and req.name:
-            cursor.execute("""
-                SELECT j.* FROM jobs j 
-                JOIN workers w ON w.current_job_id = j.job_id 
-                WHERE w.name = ? AND j.status = 'ACTIVE' AND w.current_job_id IS NOT NULL
-                ORDER BY w.last_ping DESC LIMIT 1
-            """, (req.name,))
-            job = cursor.fetchone()
-
-        # 3. Tertiary lookup: recent job chunks for this worker
+        # 2. Secondary lookup: recent job chunks for this worker
         if not job:
             cursor.execute("""
                 SELECT j.* FROM chunks c
                 JOIN jobs j ON c.job_id = j.job_id
-                WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?) AND j.status = 'ACTIVE'
+                WHERE c.assigned_worker = ? AND j.status = 'ACTIVE'
                 ORDER BY c.assigned_at DESC LIMIT 1
-            """, (req.worker_id, f"{req.name}%" if req.name else req.worker_id))
+            """, (req.worker_id,))
             job = cursor.fetchone()
 
-        # 4. Balanced Fallback: active job with least assigned chunks
+        # 3. Fallback: latest active job
         if not job:
-            cursor.execute("""
-                SELECT j.*, COUNT(c.chunk_id) as cnt FROM jobs j 
-                LEFT JOIN chunks c ON c.job_id = j.job_id AND c.status = 'ASSIGNED' 
-                WHERE j.status = 'ACTIVE' 
-                GROUP BY j.job_id 
-                ORDER BY cnt ASC, j.created_at ASC 
-                LIMIT 1
-            """)
+            cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
             job = cursor.fetchone()
 
         if not job:
@@ -911,7 +894,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             return {"status": "NO_WORK", "message": "No active jobs available"}
 
         # Link worker to this active job
-        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ? OR name = ?", (job['job_id'], req.worker_id, req.name or req.worker_id))
+        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job['job_id'], req.worker_id))
 
         current_offset_int = int(job['current_offset_hex'], 16)
         chunk_bits = min(job['chunk_bits'], job['range_bits'])
