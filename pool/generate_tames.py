@@ -26,8 +26,8 @@ def main():
 
     puzzle_num = 140
     range_bits = 90
-    dp_bits = 32
-    max_ops = 8.0
+    dp_bits = 24
+    max_ops = 1.0
     tames_filename = f"tames{puzzle_num}.dat"
 
     pubkey = "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640"
