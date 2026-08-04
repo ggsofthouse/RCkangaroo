@@ -16,13 +16,18 @@ def main():
     print("🦘 RCKangaroo — TESTE LOCAL DIRETO (PUZZLE #80)")
     print("==================================================")
 
-    root_dir = os.path.dirname(__file__)
-    bin_path = os.path.join(root_dir, "x64", "Release", "RCKangaroo.exe")
-    if not os.path.exists(bin_path):
-        bin_path = os.path.join(root_dir, "RCKangaroo.exe")
+    root_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(root_dir, "rckangaroo"),
+        os.path.join(root_dir, "RCKangaroo"),
+        os.path.join(root_dir, "RCKangaroo.exe"),
+        os.path.join(root_dir, "x64", "Release", "RCKangaroo.exe"),
+    ]
+    bin_path = next((p for p in candidates if os.path.exists(p)), None)
 
-    if not os.path.exists(bin_path):
-        print(f"❌ Binário não encontrado em: {bin_path}")
+    if not bin_path:
+        print(f"❌ Binário rckangaroo não encontrado na pasta: {root_dir}")
+        print("   No Linux, compile com: nvcc -O3 -std=c++17 -o rckangaroo RCKangaroo.cpp GpuKang.cpp Ec.cpp utils.cpp CallCubin.cpp RCGpuCore.cu -lcuda -lcudart -lpthread")
         sys.exit(1)
 
     cmd = [
