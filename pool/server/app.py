@@ -621,40 +621,35 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         workers = []
         for w in raw_workers:
             w_dict = dict(w)
+            w_name = w_dict.get('name') or w_dict['worker_id']
             cursor.execute('''
-                SELECT start_hex, range_bits, assigned_at FROM chunks 
-                WHERE assigned_worker = ? ORDER BY assigned_at DESC LIMIT 1
-            ''', (w_dict['worker_id'],))
-            chunk = cursor.fetchone()
-            if chunk:
-                w_dict['current_start_hex'] = f"0x{chunk['start_hex']}"
-                w_dict['current_range_bits'] = chunk['range_bits']
+                SELECT c.start_hex, c.range_bits, j.start_percent, j.end_percent 
+                FROM chunks c 
+                JOIN jobs j ON c.job_id = j.job_id 
+                WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?) 
+                ORDER BY c.assigned_at DESC LIMIT 1
+            ''', (w_dict['worker_id'], f"{w_name}%"))
+            chunk_job = cursor.fetchone()
+
+            if chunk_job:
+                w_dict['current_start_hex'] = f"0x{chunk_job['start_hex']}"
+                w_dict['current_range_bits'] = chunk_job['range_bits']
+                w_dict['assigned_range'] = f"{chunk_job['start_percent']}% → {chunk_job['end_percent']}%"
             else:
+                if w_dict.get('current_job_id'):
+                    cursor.execute("SELECT start_percent, end_percent FROM jobs WHERE job_id = ?", (w_dict['current_job_id'],))
+                    cj = cursor.fetchone()
+                    if cj:
+                        w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
+                    else:
+                        w_dict['assigned_range'] = "0% → 100%"
+                else:
+                    w_dict['assigned_range'] = "0% → 100%"
                 w_dict['current_start_hex'] = "Aguardando tarefa..."
                 w_dict['current_range_bits'] = "-"
-            
-            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE assigned_worker = ? AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'],))
-            w_dict['completed_chunks'] = cursor.fetchone()['cnt']
-            
-            if w_dict.get('current_job_id'):
-                cursor.execute("SELECT start_percent, end_percent FROM jobs WHERE job_id = ?", (w_dict['current_job_id'],))
-                cj = cursor.fetchone()
-                if cj:
-                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
-                else:
-                    w_dict['assigned_range'] = "0% → 100%"
-            else:
-                cursor.execute("""
-                    SELECT j.start_percent, j.end_percent FROM chunks c 
-                    JOIN jobs j ON c.job_id = j.job_id 
-                    WHERE c.assigned_worker = ? ORDER BY c.assigned_at DESC LIMIT 1
-                """, (w_dict['worker_id'],))
-                cj = cursor.fetchone()
-                if cj:
-                    w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
-                else:
-                    w_dict['assigned_range'] = "0% → 100%"
 
+            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE (assigned_worker = ? OR assigned_worker LIKE ?) AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'], f"{w_name}%"))
+            w_dict['completed_chunks'] = cursor.fetchone()['cnt']
             workers.append(w_dict)
             
         total_hashrate = sum(w['hashrate_mhs'] for w in workers)
