@@ -891,11 +891,10 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
 
         # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
         # Meta: K ≈ 1.15–1.25 (overhead 15–25%)
-        # Medições reais:  dp=32 → K=12.52 | dp=26 → K=2.52 | dp=23 → K=1.49 (29%)
-        # dp=22 (1 bit a menos, 2x DPs) → overhead≈0.245 → K≈1.24 ✓  RAM≈0.84 GB/GPU
-        # dp=21 → K≈1.12 (abaixo do alvo); dp=22 é o ponto certo
-        # dp_ideal ≈ (chunk_bits // 2) - 23  →  90-bit: 22, 80-bit: 17, 66-bit: 14(min)
-        dp_bits_dynamic = min(22, max(14, (chunk_bits // 2) - 23))
+        # Medições reais:  dp=32→K=12.52 | dp=26→K=2.52 | dp=23→K=1.49 | dp=22→K=1.33(15%)
+        # dp=21 (1 bit menos, 2x DPs) → overhead≈0.165 → K≈1.165 ✓  RAM≈1.2 GB/GPU  ← IDEAL
+        # dp_ideal ≈ (chunk_bits // 2) - 24  →  90-bit: 21, 80-bit: 16, 66-bit: 14(min)
+        dp_bits_dynamic = min(21, max(14, (chunk_bits // 2) - 24))
 
         # max_ops = (chunk_bits / range_bits) * 1.5  — margem segura com K≈1.2
         max_ops_dynamic = round((chunk_bits / job['range_bits']) * 1.5, 2)
