@@ -929,11 +929,11 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         ''', (chunk_id, job['job_id'], chunk_start_hex, chunk_bits, req.worker_id, time.time()))
 
         # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
-        # Meta: K ≈ 1.15 (DP overhead ultrabaixo ~3–5%)
-        # Medições reais:  dp=32→K=12.52 | dp=26→K=2.52 | dp=23→K=1.49 | dp=21→K=1.165
-        # dp=20 (DP 20) → overhead ≈ 3–5% → K ≈ 1.15 ✓  RAM ≈ 1.8 GB/GPU  ← SUPER OTIMIZADO
-        # dp_ideal ≈ (chunk_bits // 2) - 25  →  90-bit: 20, 80-bit: 15, 66-bit: 14(min)
-        dp_bits_dynamic = min(20, max(14, (chunk_bits // 2) - 25))
+        # Meta: K ≈ 1.15 (DP overhead ultrabaixo ~2–3%)
+        # Medições reais:  dp=32→K=12.52 | dp=26→K=2.52 | dp=21→K=1.165 | dp=20→K=1.15
+        # dp=19 (DP 19) → overhead ≈ 2–3% → K ≈ 1.15 ✓  RAM ≈ 3.6 GB/GPU
+        # dp_ideal ≈ (chunk_bits // 2) - 26  →  90-bit: 19, 80-bit: 14, 66-bit: 14(min)
+        dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
 
         # max_ops = (chunk_bits / range_bits) * 1.5  — margem segura com K≈1.15
         max_ops_dynamic = round((chunk_bits / job['range_bits']) * 1.5, 2)
