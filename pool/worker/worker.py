@@ -121,7 +121,7 @@ TARGET_PUZZLE = args.puzzle
 START_PCT = args.start_pct
 END_PCT = args.end_pct
 GPU_MASK = args.gpu if args.gpu is not None else detect_gpu_mask()
-WORKER_ID = f"{WORKER_NAME}-{int(time.time()) % 10000}"
+WORKER_ID = WORKER_NAME
 WORKER_TOKEN = args.token
 
 if not WORKER_TOKEN:

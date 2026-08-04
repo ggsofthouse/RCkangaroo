@@ -2,6 +2,7 @@ import os
 import time
 import json
 import sqlite3
+import shutil
 import hashlib
 import secrets
 import threading
@@ -55,7 +56,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB_FILE = os.path.join(os.path.dirname(__file__), "pool.db")
+import collections
+
+server_logs = collections.deque(maxlen=150)
+
+def log_event(msg: str):
+    timestamp = time.strftime('%H:%M:%S', time.localtime())
+    formatted = f"[{timestamp}] {msg}"
+    print(formatted)
+    server_logs.append(formatted)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "pool.db")
 db_lock = threading.RLock()
 security = HTTPBasic()
 
@@ -79,6 +91,8 @@ if not WORKER_TOKEN:
 def verify_worker_token(request: Request):
     """Dependência usada em todos os endpoints de worker para validar o token."""
     token = request.headers.get("X-Worker-Token", "")
+    if not token:
+        token = request.query_params.get("token", "")
     if not secrets.compare_digest(token, WORKER_TOKEN):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Token de worker inválido")
 
@@ -187,13 +201,24 @@ def verify_private_key(privkey_hex: str, target_pubkey_hex: str) -> bool:
         return False
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30.0)
-    conn.execute("PRAGMA busy_timeout = 30000;")
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=60.0)
+    conn.execute("PRAGMA busy_timeout = 60000;")
+    conn.execute("PRAGMA journal_mode = WAL;")
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db():
     with db_lock:
+        try:
+            backup_dir = os.path.join(BASE_DIR, "backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
+                backup_path = os.path.join(backup_dir, f"pool_auto_{int(time.time())}.db")
+                shutil.copy2(DB_FILE, backup_path)
+                print(f"📦 Backup automático do banco criado em: {backup_path}")
+        except Exception as e:
+            print(f"⚠️ Erro ao criar backup automático: {e}")
+
         conn = get_db()
         cursor = conn.cursor()
         
@@ -346,6 +371,7 @@ class WorkerHeartbeatRequest(BaseModel):
 
 class WorkRequest(BaseModel):
     worker_id: str
+    name: Optional[str] = None
     hashrate_mhs: Optional[float] = None
 
 class CompleteChunkRequest(BaseModel):
@@ -410,19 +436,19 @@ PUZZLE_PRESETS = {
         "pubkey": "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640",
         "bits": 140,
         "base_start": "80000000000000000000000000000000000",
-        "chunk_bits": 90   # ~2-6h por chunk em RTX 4090/5090 — menos overhead de coordenação
+        "chunk_bits": 78   # ~15-25 min por chunk em 2x RTX 5090 — feedback rápido e progresso constante
     },
     145: {
         "pubkey": "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5",
         "bits": 145,
         "base_start": "1000000000000000000000000000000000000",
-        "chunk_bits": 90
+        "chunk_bits": 78
     },
     150: {
         "pubkey": "03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49",
         "bits": 150,
         "base_start": "20000000000000000000000000000000000000",
-        "chunk_bits": 90
+        "chunk_bits": 78
     }
 }
 
@@ -736,6 +762,9 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 m = (up_sec % 3600) // 60
                 active_job_uptime = f"{h}h {m}m"
 
+        active_kangaroos_str = f"{active_kangaroos_m:.1f}M" if total_gpus > 0 else "0.0M"
+        dp_str = "1% ~ 2%"
+
         return {
             "active_workers_count": len(workers),
             "total_gpus_count": total_gpus,
@@ -745,14 +774,15 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "assigned_chunks_count": assigned_chunks,
             "pending_chunks_count": pending_chunks,
             "total_created_chunks": total_created_chunks,
-            "active_kangaroos_m": f"{active_kangaroos_m}M+",
-            "dp_overhead_str": "7% ~ 15%",
+            "active_kangaroos_m": active_kangaroos_str,
+            "dp_overhead_str": dp_str,
             "active_job_uptime": active_job_uptime,
             "keys_tested": keys_tested,
             "keys_zetta_str": keys_zetta_str,
             "workers": workers,
             "jobs": jobs,
-            "coverage": cov_data
+            "coverage": cov_data,
+            "logs": list(server_logs)
         }
 
 # Open Worker Endpoints (Auto-Creates Job if No Active Job Exists)
@@ -793,7 +823,7 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
                         e_off = b_start + int((float(row['end_percent']) / 100.0) * tot_r)
                         if cur_off >= e_off:
                             cursor.execute("UPDATE jobs SET current_offset_hex = start_hex WHERE job_id = ?", (job_id,))
-                            cursor.execute("UPDATE chunks SET status = 'CANCELLED' WHERE job_id = ?", (job_id,))
+                            cursor.execute("DELETE FROM chunks WHERE job_id = ?", (job_id,))
                     except Exception:
                         pass
 
@@ -836,6 +866,7 @@ def register_worker(req: WorkerRegisterRequest, _: None = Depends(verify_worker_
         ''', (req.worker_id, req.name, req.os_info, req.gpu_info, time.time()))
         conn.commit()
         conn.close()
+        log_event(f"👤 Worker registrado: {req.name} ({req.worker_id}) | GPU: {req.gpu_info or 'N/A'}")
     return {"status": "REGISTERED", "worker_id": req.worker_id}
 
 @app.post("/api/worker/heartbeat")
@@ -861,17 +892,41 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         else:
             cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (time.time(), req.worker_id))
 
-        # 1. Primary lookup: active job linked via workers.current_job_id
+        # 0. Check if worker ALREADY has an ASSIGNED chunk that hasn't been completed yet
         cursor.execute("""
-            SELECT j.* FROM jobs j 
-            JOIN workers w ON w.current_job_id = j.job_id 
-            WHERE (w.worker_id = ? OR w.name = ?) AND j.status = 'ACTIVE' 
-            LIMIT 1
-        """, (req.worker_id, req.name or req.worker_id))
-        job = cursor.fetchone()
+            SELECT c.*, j.pubkey, j.range_bits as job_range_bits, j.status as job_status
+            FROM chunks c
+            JOIN jobs j ON c.job_id = j.job_id
+            WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?)
+              AND c.status = 'ASSIGNED'
+              AND j.status = 'ACTIVE'
+            ORDER BY c.assigned_at DESC LIMIT 1
+        """, (req.worker_id, f"{req.name}%" if req.name else req.worker_id))
+        existing_chunk = cursor.fetchone()
 
-        # 2. Name-based explicit range lookup (e.g. Vast-2x-A1 -> 0-6%, Vast-2x-A2 -> 6-12%, etc.)
-        if not job and req.name:
+        if existing_chunk:
+            chunk_bits = existing_chunk['range_bits']
+            dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
+            max_ops_dynamic = round((chunk_bits / existing_chunk['job_range_bits']) * 1.5, 2)
+            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (existing_chunk['job_id'], req.worker_id))
+            conn.commit()
+            conn.close()
+            log_event(f"🔄 Retomando chunk {existing_chunk['chunk_id']} pendente para worker {req.name or req.worker_id}")
+            return {
+                "status": "WORK_ASSIGNED",
+                "chunk_id": existing_chunk['chunk_id'],
+                "job_id": existing_chunk['job_id'],
+                "pubkey": existing_chunk['pubkey'],
+                "start_hex": existing_chunk['start_hex'],
+                "range_bits": existing_chunk['job_range_bits'],
+                "chunk_bits": chunk_bits,
+                "dp_bits": dp_bits_dynamic,
+                "max_ops": str(max_ops_dynamic)
+            }
+
+        job = None
+        # 1. Primary lookup: Explicit range matching by worker name (e.g. Vast-2x-A1 -> 0-6%, Vast-2x-A2 -> 6-12%)
+        if req.name:
             pct_map = {'A1': 0.0, 'A2': 6.0, 'A3': 12.0, 'A4': 18.0, 'A5': 24.0, 'A6': 85.0, 'A7': 90.0, 'A8': 95.0}
             for k, pct in pct_map.items():
                 if k in req.name:
@@ -879,6 +934,16 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
                     job = cursor.fetchone()
                     if job:
                         break
+
+        # 2. Secondary lookup: active job linked via workers.current_job_id
+        if not job:
+            cursor.execute("""
+                SELECT j.* FROM jobs j 
+                JOIN workers w ON w.current_job_id = j.job_id 
+                WHERE (w.worker_id = ? OR w.name = ?) AND j.status = 'ACTIVE' 
+                LIMIT 1
+            """, (req.worker_id, req.name or req.worker_id))
+            job = cursor.fetchone()
 
         # 3. Tertiary lookup: recent job chunks for this worker
         if not job:
@@ -939,6 +1004,10 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         cursor.execute('''
             INSERT INTO chunks (chunk_id, job_id, start_hex, range_bits, assigned_worker, assigned_at, status)
             VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED')
+            ON CONFLICT(chunk_id) DO UPDATE SET
+                assigned_worker=excluded.assigned_worker,
+                assigned_at=excluded.assigned_at,
+                status='ASSIGNED'
         ''', (chunk_id, job['job_id'], chunk_start_hex, chunk_bits, req.worker_id, time.time()))
 
         # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
@@ -953,6 +1022,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
 
         conn.commit()
         conn.close()
+        log_event(f"🚀 Work atribuído para {req.name or req.worker_id}: Chunk {chunk_id} (Bits: {chunk_bits}, DP: {dp_bits_dynamic})")
 
         return {
             "status": "WORK_ASSIGNED",
@@ -987,9 +1057,9 @@ def complete_chunk(req: CompleteChunkRequest, _: None = Depends(verify_worker_to
                 "UPDATE workers SET last_ping = ?, completed_chunks = completed_chunks + 1 WHERE worker_id = ?",
                 (now, req.worker_id)
             )
-            print(f"✅ Chunk {req.chunk_id} marcado como COMPLETED pelo worker {req.worker_id}")
+            log_event(f"✅ Chunk {req.chunk_id} marcado como COMPLETED pelo worker {req.worker_id}")
         else:
-            print(f"⚠️  complete_chunk ignorado: chunk {req.chunk_id} não estava ASSIGNED para {req.worker_id}")
+            log_event(f"⚠️ complete_chunk ignorado: chunk {req.chunk_id} não estava ASSIGNED para {req.worker_id}")
 
         conn.commit()
         conn.close()
@@ -1263,8 +1333,8 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 <div class="col-12 col-sm-6 col-xl-3">
                     <div class="glass-card stat-card" style="--accent-color: var(--accent-purple);">
                         <div class="stat-title">🎯 DP OVERHEAD (EFICIÊNCIA)</div>
-                        <div class="stat-header text-purple fs-3" style="color: #c084fc;" id="dp-overhead">7% ~ 15%</div>
-                        <div class="fs-7 text-secondary mt-1">K ≈ 1.15–1.23 (Baixo Overhead)</div>
+                        <div class="stat-header text-purple fs-3" style="color: #c084fc;" id="dp-overhead">1% ~ 2%</div>
+                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">K ≈ 1.15 (1% Overhead)</div>
                     </div>
                 </div>
 
@@ -1272,8 +1342,8 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 <div class="col-12 col-sm-6 col-xl-3">
                     <div class="glass-card stat-card" style="--accent-color: var(--accent-cyan);">
                         <div class="stat-title">🧠 KANGAROOS ATIVOS</div>
-                        <div class="stat-header text-info fs-3" id="active-kangaroos">16.0M+</div>
-                        <div class="fs-7 text-secondary mt-1" id="active-gpus-subtext">8 GPUs operando em paralelo</div>
+                        <div class="stat-header text-info fs-3" id="active-kangaroos">0.0M</div>
+                        <div class="fs-7 text-secondary mt-1" id="active-gpus-subtext">0 GPUs operando</div>
                     </div>
                 </div>
                 <!-- 6. Tempo de Processamento -->
@@ -1300,6 +1370,23 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         <div class="fs-7 text-secondary mt-1">SQLite WAL + COVERAGE.TXT</div>
                     </div>
                 </div>
+            </div>
+
+            <!-- Live VPS Server Logs Console -->
+            <div class="glass-card p-3 p-md-4 mb-4" style="border: 1px solid rgba(56, 189, 248, 0.25);">
+                <div class="d-flex justify-content-between align-items-center mb-2">
+                    <div class="d-flex align-items-center gap-2">
+                        <span class="fs-5">📟</span>
+                        <h2 class="section-title mb-0">Logs em Tempo Real da VPS</h2>
+                        <span class="badge badge-glow-green px-2.5 py-1 rounded-pill fs-7">
+                            <span class="pulse-dot me-1"></span> Live Feed (VPS)
+                        </span>
+                    </div>
+                    <button class="btn btn-outline-secondary btn-sm rounded-3" onclick="document.getElementById('vps-logs-box').textContent = ''">
+                        🧹 Limpar Console
+                    </button>
+                </div>
+                <div id="vps-logs-box" class="font-mono p-3 rounded-3 fs-7" style="background-color: #030712; color: #38bdf8; border: 1px solid #1e293b; max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">[Aguardando atividade dos workers na VPS...]</div>
             </div>
 
             <!-- Active Target Puzzle Card -->
