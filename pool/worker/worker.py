@@ -327,7 +327,11 @@ def main():
     while True:
         try:
             # Request work chunk
-            work = http_post("/api/worker/get_work", {"worker_id": WORKER_ID, "hashrate_mhs": last_known_mhs})
+            work = http_post("/api/worker/get_work", {
+                "worker_id": WORKER_ID,
+                "name": WORKER_NAME,
+                "hashrate_mhs": last_known_mhs
+            })
             
             if not work or work.get("status") == "NO_WORK":
                 print(f"⚙️ Ativando Puzzle #{TARGET_PUZZLE} ({START_PCT}% -> {END_PCT}%) no servidor...")

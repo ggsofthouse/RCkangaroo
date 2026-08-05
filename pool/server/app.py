@@ -252,7 +252,8 @@ def init_db():
                 range_bits INTEGER NOT NULL,
                 assigned_worker TEXT,
                 assigned_at REAL,
-                status TEXT DEFAULT 'PENDING'
+                status TEXT DEFAULT 'PENDING',
+                last_heartbeat REAL
             )
         ''')
 
@@ -290,6 +291,7 @@ def init_db():
         chunks_cols = [
             ("completed_at", "REAL"),
             ("heartbeat_at", "REAL"),
+            ("last_heartbeat", "REAL")
         ]
         for col_name, col_type in chunks_cols:
             try:
@@ -374,6 +376,11 @@ class WorkRequest(BaseModel):
     name: Optional[str] = None
     hashrate_mhs: Optional[float] = None
 
+class ChunkHeartbeatRequest(BaseModel):
+    worker_id: str
+    chunk_id: str
+    hashrate_mhs: float = 0.0
+
 class CompleteChunkRequest(BaseModel):
     worker_id: str
     chunk_id: str
@@ -456,7 +463,7 @@ def internal_create_job(req: CreateJobRequest) -> str:
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
-        job_id = f"job_{int(time.time())}"
+        job_id = f"job_{int(time.time() * 1000)}_{secrets.token_hex(2)}"
         
         start_pct = max(0.0, min(100.0, req.start_percent))
         end_pct = max(start_pct, min(100.0, req.end_percent))
@@ -881,108 +888,142 @@ def heartbeat(req: WorkerHeartbeatRequest, _: None = Depends(verify_worker_token
         conn.close()
     return {"status": "OK"}
 
+@app.post("/api/worker/chunk_heartbeat")
+def chunk_heartbeat(req: ChunkHeartbeatRequest, _: None = Depends(verify_worker_token)):
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        now = time.time()
+
+        cursor.execute("""
+            UPDATE chunks 
+            SET last_heartbeat = ?
+            WHERE chunk_id = ? AND assigned_worker = ? AND status = 'ASSIGNED'
+        """, (now, req.chunk_id, req.worker_id))
+
+        cursor.execute("""
+            UPDATE workers 
+            SET last_ping = ?, hashrate_mhs = ?
+            WHERE worker_id = ?
+        """, (now, req.hashrate_mhs, req.worker_id))
+
+        conn.commit()
+        conn.close()
+    return {"status": "OK"}
+
 @app.post("/api/worker/get_work")
 def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
+        now = time.time()
 
         if req.hashrate_mhs is not None and req.hashrate_mhs > 0:
-            cursor.execute("UPDATE workers SET last_ping = ?, hashrate_mhs = ? WHERE worker_id = ?", (time.time(), req.hashrate_mhs, req.worker_id))
+            cursor.execute("UPDATE workers SET last_ping = ?, hashrate_mhs = ? WHERE worker_id = ?", (now, req.hashrate_mhs, req.worker_id))
         else:
-            cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (time.time(), req.worker_id))
+            cursor.execute("UPDATE workers SET last_ping = ? WHERE worker_id = ?", (now, req.worker_id))
 
-        # 0. Check if worker ALREADY has an ASSIGNED chunk that hasn't been completed yet
+        # === 1. Recupera chunks abandonados (timeout de 20 minutos) ===
+        TIMEOUT_SECONDS = 20 * 60  # 20 minutos
         cursor.execute("""
-            SELECT c.*, j.pubkey, j.range_bits as job_range_bits, j.status as job_status
-            FROM chunks c
-            JOIN jobs j ON c.job_id = j.job_id
-            WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?)
-              AND c.status = 'ASSIGNED'
-              AND j.status = 'ACTIVE'
-            ORDER BY c.assigned_at DESC LIMIT 1
-        """, (req.worker_id, f"{req.name}%" if req.name else req.worker_id))
-        existing_chunk = cursor.fetchone()
+            UPDATE chunks 
+            SET status = 'PENDING', assigned_worker = NULL
+            WHERE status = 'ASSIGNED' 
+              AND (last_heartbeat IS NULL OR (? - COALESCE(last_heartbeat, assigned_at)) > ?)
+        """, (now, TIMEOUT_SECONDS))
 
-        if existing_chunk:
-            chunk_bits = existing_chunk['range_bits']
-            dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
-            max_ops_dynamic = round((chunk_bits / existing_chunk['job_range_bits']) * 1.5, 2)
-            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (existing_chunk['job_id'], req.worker_id))
-            conn.commit()
-            conn.close()
-            log_event(f"🔄 Retomando chunk {existing_chunk['chunk_id']} pendente para worker {req.name or req.worker_id}")
-            return {
-                "status": "WORK_ASSIGNED",
-                "chunk_id": existing_chunk['chunk_id'],
-                "job_id": existing_chunk['job_id'],
-                "pubkey": existing_chunk['pubkey'],
-                "start_hex": existing_chunk['start_hex'],
-                "range_bits": existing_chunk['job_range_bits'],
-                "chunk_bits": chunk_bits,
-                "dp_bits": dp_bits_dynamic,
-                "max_ops": str(max_ops_dynamic)
-            }
-
+        # === 2. Identifica o Job Alvo do Worker com base no Nome (A1..A10) ===
+        worker_identifier = req.name or req.worker_id or ""
         job = None
-        # 1. Primary lookup: Explicit range matching by worker name (e.g. Vast-2x-A1 -> 0-6%, Vast-2x-A2 -> 6-12%)
-        if req.name:
-            pct_map = {'A1': 0.0, 'A2': 6.0, 'A3': 12.0, 'A4': 18.0, 'A5': 24.0, 'A6': 85.0, 'A7': 90.0, 'A8': 95.0}
+
+        if worker_identifier:
+            pct_map = {
+                'A1': 0.0, 'A2': 10.0, 'A3': 20.0, 'A4': 30.0, 'A5': 40.0,
+                'A6': 50.0, 'A7': 60.0, 'A8': 70.0, 'A9': 80.0, 'A10': 90.0
+            }
             for k, pct in pct_map.items():
-                if k in req.name:
+                if k in worker_identifier:
                     cursor.execute("SELECT * FROM jobs WHERE ABS(start_percent - ?) < 0.1 AND status = 'ACTIVE' LIMIT 1", (pct,))
                     job = cursor.fetchone()
                     if job:
                         break
 
-        # 2. Secondary lookup: active job linked via workers.current_job_id
+        # Fallback: job ativo registrado do worker
         if not job:
             cursor.execute("""
                 SELECT j.* FROM jobs j 
                 JOIN workers w ON w.current_job_id = j.job_id 
                 WHERE (w.worker_id = ? OR w.name = ?) AND j.status = 'ACTIVE' 
                 LIMIT 1
-            """, (req.worker_id, req.name or req.worker_id))
+            """, (req.worker_id, worker_identifier))
             job = cursor.fetchone()
 
-        # 3. Tertiary lookup: recent job chunks for this worker
+        # Fallback: último job ativo criado
         if not job:
-            cursor.execute("""
-                SELECT j.* FROM chunks c
-                JOIN jobs j ON c.job_id = j.job_id
-                WHERE (c.assigned_worker = ? OR c.assigned_worker LIKE ?) AND j.status = 'ACTIVE'
-                ORDER BY c.assigned_at DESC LIMIT 1
-            """, (req.worker_id, f"{req.name}%" if req.name else req.worker_id))
-            job = cursor.fetchone()
-
-        # 4. Fallback: pick active job with least assigned chunks
-        if not job:
-            cursor.execute("""
-                SELECT j.*, COUNT(c.chunk_id) as cnt FROM jobs j 
-                LEFT JOIN chunks c ON c.job_id = j.job_id AND c.status = 'ASSIGNED' 
-                WHERE j.status = 'ACTIVE' 
-                GROUP BY j.job_id 
-                ORDER BY cnt ASC, j.created_at ASC 
-                LIMIT 1
-            """)
+            cursor.execute("SELECT * FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
             job = cursor.fetchone()
 
         if not job:
+            conn.commit()
             conn.close()
-            return {"status": "NO_WORK", "message": "No active jobs available"}
+            return {"status": "NO_WORK", "message": "Nenhum job ativo disponível"}
 
-        # Link worker to this active job
-        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", (job['job_id'], req.worker_id))
+        job = dict(job)
+
+        # === 3. Tenta pegar um chunk PENDING (abandonado) DO MESMO JOB primeiro ===
+        cursor.execute("""
+            SELECT c.*, j.pubkey, j.dp_bits, j.range_bits as job_range_bits
+            FROM chunks c
+            JOIN jobs j ON c.job_id = j.job_id
+            WHERE c.status = 'PENDING' AND c.job_id = ? AND j.status = 'ACTIVE'
+            ORDER BY c.assigned_at ASC
+            LIMIT 1
+        """, (job['job_id'],))
+        pending = cursor.fetchone()
+
+        if pending:
+            chunk = dict(pending)
+            chunk_bits = chunk['range_bits']
+            dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
+            cursor.execute("""
+                UPDATE chunks 
+                SET status = 'ASSIGNED',
+                    assigned_worker = ?,
+                    assigned_at = ?,
+                    last_heartbeat = ?
+                WHERE chunk_id = ?
+            """, (req.worker_id, now, now, chunk['chunk_id']))
+
+            cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", 
+                           (chunk['job_id'], req.worker_id))
+
+            conn.commit()
+            conn.close()
+            log_event(f"♻️ Reatribuindo chunk abandonado {chunk['chunk_id']} para {worker_identifier}")
+
+            return {
+                "status": "WORK_ASSIGNED",
+                "chunk_id": chunk['chunk_id'],
+                "job_id": chunk['job_id'],
+                "pubkey": chunk['pubkey'],
+                "start_hex": chunk['start_hex'],
+                "range_bits": chunk['job_range_bits'],
+                "chunk_bits": chunk_bits,
+                "dp_bits": dp_bits_dynamic,
+                "max_ops": "1.0"
+            }
+
+        # === 4. Avança o offset do Job específico do Worker ===
+        cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", 
+                       (job['job_id'], req.worker_id))
 
         current_offset_int = int(job['current_offset_hex'], 16)
-        chunk_bits = min(job['chunk_bits'], job['range_bits'])
+        chunk_bits = min(job.get('chunk_bits', 78), job['range_bits'])
         if chunk_bits < 48 and job['range_bits'] >= 48:
-            chunk_bits = 66
-            
+            chunk_bits = 78
+
         chunk_size = 1 << chunk_bits
 
-        # 🛡️ TRAVA DE FIM DE FATIA: calcula o endereço hex final do job
-        # e impede que o ponteiro vaze além do end_percent da fatia.
         base_start_int = int(job['base_start_hex'], 16)
         total_range_int = 1 << job['range_bits']
         end_pct = float(job['end_percent'])
@@ -991,24 +1032,50 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         if current_offset_int >= end_offset_int:
             conn.commit()
             conn.close()
-            print(f"✅ Job {job['job_id']} atingiu o fim da fatia ({end_pct:.2f}%). Retornando NO_WORK.")
             return {"status": "NO_WORK", "message": f"Fatia concluída até {end_pct:.2f}%"}
 
         chunk_id = f"{job['job_id']}_chunk_{hex(current_offset_int)[2:]}"
         chunk_start_hex = hex(current_offset_int)[2:]
-        
-        next_offset_int = current_offset_int + chunk_size
-        next_offset_hex = hex(next_offset_int)[2:]
+        next_offset_hex = hex(current_offset_int + chunk_size)[2:]
 
-        cursor.execute("UPDATE jobs SET current_offset_hex = ? WHERE job_id = ?", (next_offset_hex, job['job_id']))
+        cursor.execute(
+            "UPDATE jobs SET current_offset_hex = ? WHERE job_id = ?",
+            (next_offset_hex, job['job_id'])
+        )
+
         cursor.execute('''
-            INSERT INTO chunks (chunk_id, job_id, start_hex, range_bits, assigned_worker, assigned_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED')
+            INSERT INTO chunks (
+                chunk_id, job_id, start_hex, range_bits,
+                assigned_worker, assigned_at, status, last_heartbeat
+            ) VALUES (?, ?, ?, ?, ?, ?, 'ASSIGNED', ?)
             ON CONFLICT(chunk_id) DO UPDATE SET
                 assigned_worker=excluded.assigned_worker,
                 assigned_at=excluded.assigned_at,
-                status='ASSIGNED'
-        ''', (chunk_id, job['job_id'], chunk_start_hex, chunk_bits, req.worker_id, time.time()))
+                status='ASSIGNED',
+                last_heartbeat=excluded.last_heartbeat
+        ''', (
+            chunk_id, job['job_id'], chunk_start_hex, chunk_bits,
+            req.worker_id, now, now
+        ))
+
+        dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
+
+        conn.commit()
+        conn.close()
+
+        log_event(f"📦 Novo chunk {chunk_id} (bits={chunk_bits}) atribuído a {worker_identifier}")
+
+        return {
+            "status": "WORK_ASSIGNED",
+            "chunk_id": chunk_id,
+            "job_id": job['job_id'],
+            "pubkey": job['pubkey'],
+            "start_hex": chunk_start_hex,
+            "range_bits": job['range_bits'],
+            "chunk_bits": chunk_bits,
+            "dp_bits": dp_bits_dynamic,
+            "max_ops": "1.0"
+        }
 
         # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
         # Meta: K ≈ 1.15 (DP overhead ultrabaixo ~2–3%)
