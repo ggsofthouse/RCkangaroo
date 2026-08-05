@@ -23,4 +23,10 @@ pool/fetch_live_vps.py
 pool/deploy_vps.py
 pool/recreate_10_jobs.py
 pool/test_fixes.py
+pool/apply_offsets.py
+pool/check_safety_audit.py
+*.pyc
 RESULTS.TXT
+.env*
+*.key
+*.token

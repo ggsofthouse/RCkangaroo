@@ -22,24 +22,41 @@ ssh = paramiko.SSHClient()
 ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 ssh.connect(host, username=user, password=password)
 
-remote_script = '''import sqlite3, os
-conn = sqlite3.connect('/opt/rckangaroo/pool/server/pool.db')
-c = conn.cursor()
-tables = [t[0] for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
-print("=== TABELAS SQLITE DO POOL ===")
-for t in tables:
-    cnt = c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-    print(f"  • {t}: {cnt} registros")
+remote_script = '''import os, glob, subprocess
 
-print("\\n=== CHUNKS COMPLETED / SOLVED / CANCELLED ===")
-for st in ['COMPLETED', 'SOLVED', 'ASSIGNED', 'PENDING', 'CANCELLED']:
-    cnt = c.execute(f"SELECT COUNT(*) FROM chunks WHERE status='{st}'").fetchone()[0]
-    print(f"  • Status {st}: {cnt} chunks")
+print("=== 1. BUSCANDO ARQUIVOS DE BACKUP E .DB EM TODO O DISCO DA VPS ===")
+found_files = []
+for root, dirs, files in os.walk('/'):
+    if any(skip in root for skip in ['/proc', '/sys', '/dev', '/run', '/var/lib/docker/overlay2']):
+        continue
+    for f in files:
+        if any(ext in f.lower() for ext in ['pool', '.db', '.bak', '.sqlite', 'coverage', 'results']):
+            full_path = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(full_path)
+                found_files.append((full_path, sz))
+            except Exception:
+                pass
 
-print("\\n=== ARQUIVOS EM /opt/rckangaroo/pool/server ===")
-for f in os.listdir('/opt/rckangaroo/pool/server'):
-    sz = os.path.getsize(os.path.join('/opt/rckangaroo/pool/server', f))
-    print(f"  • {f} ({sz} bytes)")
+for path, sz in found_files:
+    print(f"  • {path} ({sz} bytes)")
+
+print("\\n=== 2. ANALISANDO STRINGS E RECURSOS NO POOL.DB E POOL.DB-WAL ===")
+wal_path = '/opt/rckangaroo/pool/server/pool.db-wal'
+db_path = '/opt/rckangaroo/pool/server/pool.db'
+
+for p in [db_path, wal_path]:
+    if os.path.exists(p):
+        try:
+            res = subprocess.run(["strings", p], capture_output=True, text=True, errors="replace")
+            lines = [l for l in res.stdout.splitlines() if "chunk_" in l or "job_" in l or "0x" in l]
+            print(f"  • {p}: {len(lines)} registros de chunk/job/hex encontrados nas strings brutas")
+            if lines:
+                print("    Amostra dos 15 primeiros:")
+                for l in lines[:15]:
+                    print("     ", l)
+        except Exception as e:
+            print(f"  • Erro ao analisar {p}: {e}")
 '''
 
 sftp = ssh.open_sftp()
