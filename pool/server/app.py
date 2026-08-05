@@ -984,7 +984,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         if pending:
             chunk = dict(pending)
             chunk_bits = chunk['range_bits']
-            dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
+            dp_bits_dynamic = 18 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26))
             cursor.execute("""
                 UPDATE chunks 
                 SET status = 'ASSIGNED',
@@ -1058,7 +1058,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             req.worker_id, now, now
         ))
 
-        dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
+        dp_bits_dynamic = 18 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26))
 
         conn.commit()
         conn.close()
