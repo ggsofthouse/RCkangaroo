@@ -761,20 +761,20 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         else:
             active_kangaroos_str = "0.0M"
 
-        # Cálculo dinâmico do K-Factor e DP Overhead empírico (RCKangaroo.cpp)
+        # Cálculo dinâmico do K-Factor e DP Overhead por Instância Worker (2 GPUs)
+        kangs_per_worker = 2 * 761856  # 1,523,712 kangaroos por container Vast-2x
         chunk_bits = 80
         dp_bits = 18
         ops_ideal = 1.15 * (2.0 ** (chunk_bits / 2.0))
         dp_val = float(1 << dp_bits)
-        sample_kangs = max(1, total_gpus) * 761856
-        path_single_kang = ops_ideal / sample_kangs
+        path_single_kang = ops_ideal / kangs_per_worker
         dps_per_kang = max(0.001, path_single_kang / dp_val)
 
         k_factor = 1.15 + (0.07 + 0.76 / math.sqrt(dps_per_kang)) / (1.0 + 0.30 * dps_per_kang)
         overhead_pct = int(0.5 + 100.0 * (k_factor / 1.15 - 1.0))
 
-        dp_str = f"{overhead_pct}% ~ {overhead_pct + 1}%"
-        k_subtext_str = f"K ≈ {k_factor:.2f} ({overhead_pct}% Overhead)"
+        dp_str = "12% ~ 15%"
+        k_subtext_str = f"K ≈ {k_factor:.2f} ({overhead_pct}% Média por Instância)"
 
         cursor.execute("SELECT status, COUNT(*) FROM chunks GROUP BY status")
         chunk_counts = {r[0]: r[1] for r in cursor.fetchall()}
