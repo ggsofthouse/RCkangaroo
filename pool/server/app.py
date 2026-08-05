@@ -773,8 +773,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         k_factor = 1.15 + (0.07 + 0.76 / math.sqrt(dps_per_kang)) / (1.0 + 0.30 * dps_per_kang)
         overhead_pct = int(0.5 + 100.0 * (k_factor / 1.15 - 1.0))
 
-        dp_str = f"{overhead_pct}%"
-        k_subtext_str = f"K ≈ {k_factor:.2f} ({overhead_pct}% Overhead)"
+        dp_str = "12% ~ 15%"
+        k_subtext_str = "K ≈ 1.28 ~ 1.33 (12% ~ 15% Overhead)"
 
         cursor.execute("SELECT status, COUNT(*) FROM chunks GROUP BY status")
         chunk_counts = {r[0]: r[1] for r in cursor.fetchall()}
@@ -1422,8 +1422,8 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 <div class="col-12 col-sm-6 col-xl-3">
                     <div class="glass-card stat-card" style="--accent-color: var(--accent-purple);">
                         <div class="stat-title">🎯 DP OVERHEAD (EFICIÊNCIA)</div>
-                        <div class="stat-header text-purple fs-3" style="color: #c084fc;" id="dp-overhead">1% ~ 2%</div>
-                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">K ≈ 1.15 (1% Overhead)</div>
+                        <div class="stat-header text-purple fs-3" style="color: #c084fc;" id="dp-overhead">12% ~ 15%</div>
+                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">K ≈ 1.28 ~ 1.33 (12% ~ 15% Overhead)</div>
                     </div>
                 </div>
 
