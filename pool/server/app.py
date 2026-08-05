@@ -1518,9 +1518,9 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         <h2 class="section-title mb-0">📋 Jobs de Busca Cadastrados</h2>
                         <span class="text-secondary fs-7">Gerenciamento de intervalos ativos e resolvidos</span>
                     </div>
-                    <button class="btn btn-outline-danger btn-sm rounded-3" onclick="clearOldJobs()">
-                        🗑️ Limpar Todos os Jobs
-                    </button>
+                    <span class="badge bg-dark border border-secondary text-success rounded-3 px-3 py-1.5 fs-7">
+                        🔒 Progresso Protegido na VPS (WAL)
+                    </span>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-custom align-middle">
@@ -1750,10 +1750,10 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                 <td><span class="badge ${j.status === 'SOLVED' ? 'badge-glow-green' : 'badge-glow-cyan'}">${j.status}</span></td>
                                 <td class="font-mono">
                                     ${j.status === 'SOLVED' ? `
-                                        <button class="btn btn-sm btn-outline-danger me-2" onclick="deleteSingleJob('${j.job_id}')">🗑️ Apagar</button>
-                                        <span class="text-success font-semibold">${j.private_key_hex}</span>
+                                        <span class="text-success font-semibold me-2">${j.private_key_hex}</span>
+                                        <button class="btn btn-sm btn-outline-success" onclick="copyText('${j.private_key_hex}')">📋 Copiar</button>
                                     ` : `
-                                        <button class="btn btn-sm btn-outline-danger" onclick="deleteSingleJob('${j.job_id}')">🗑️ Apagar</button>
+                                        <span class="badge badge-glow-green fs-7">🟢 Protegido & Ativo</span>
                                     `}
                                 </td>
                             </tr>
