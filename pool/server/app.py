@@ -6,6 +6,7 @@ import shutil
 import hashlib
 import secrets
 import threading
+import math
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -750,7 +751,30 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             g_cnt = max(1, len([g for g in gpu_str.split(",") if g.strip()])) if gpu_str else 1
             total_gpus += g_cnt
 
-        active_kangaroos_m = round(total_gpus * 2.0029, 1)  # ~2M kangaroos por GPU RTX 4090/5090
+        # Kangaroos Ativos reais alocados (761,856 kangaroos por GPU de 24GB do RCKangaroo)
+        total_kangaroos_cnt = total_gpus * 761856
+        if total_gpus > 0:
+            if total_kangaroos_cnt >= 1_000_000:
+                active_kangaroos_str = f"{total_kangaroos_cnt / 1_000_000:.1f}M"
+            else:
+                active_kangaroos_str = f"{total_kangaroos_cnt / 1_000:.0f}K"
+        else:
+            active_kangaroos_str = "0.0M"
+
+        # Cálculo dinâmico do K-Factor e DP Overhead empírico (RCKangaroo.cpp)
+        chunk_bits = 78
+        dp_bits = 16
+        ops_ideal = 1.15 * (2.0 ** (chunk_bits / 2.0))
+        dp_val = float(1 << dp_bits)
+        sample_kangs = max(1, total_gpus) * 761856
+        path_single_kang = ops_ideal / sample_kangs
+        dps_per_kang = max(0.001, path_single_kang / dp_val)
+
+        k_factor = 1.15 + (0.07 + 0.76 / math.sqrt(dps_per_kang)) / (1.0 + 0.30 * dps_per_kang)
+        overhead_pct = int(0.5 + 100.0 * (k_factor / 1.15 - 1.0))
+
+        dp_str = f"{overhead_pct}%"
+        k_subtext_str = f"K ≈ {k_factor:.2f} ({overhead_pct}% Overhead)"
 
         cursor.execute("SELECT status, COUNT(*) FROM chunks GROUP BY status")
         chunk_counts = {r[0]: r[1] for r in cursor.fetchall()}
@@ -769,9 +793,6 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 m = (up_sec % 3600) // 60
                 active_job_uptime = f"{h}h {m}m"
 
-        active_kangaroos_str = f"{active_kangaroos_m:.1f}M" if total_gpus > 0 else "0.0M"
-        dp_str = "1% ~ 2%"
-
         return {
             "active_workers_count": len(workers),
             "total_gpus_count": total_gpus,
@@ -783,6 +804,7 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "total_created_chunks": total_created_chunks,
             "active_kangaroos_m": active_kangaroos_str,
             "dp_overhead_str": dp_str,
+            "k_subtext_str": k_subtext_str,
             "active_job_uptime": active_job_uptime,
             "keys_tested": keys_tested,
             "keys_zetta_str": keys_zetta_str,
@@ -1566,8 +1588,11 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     document.getElementById('completed-chunks').innerText = (data.total_completed_chunks || 0).toLocaleString() + ' chunks';
                     document.getElementById('active-chunks-status').innerText = (data.assigned_chunks_count || 0) + ' ativos';
                     document.getElementById('chunks-total-subtext').innerText = (data.total_created_chunks || 0) + ' gerados no total';
-                    document.getElementById('dp-overhead').innerText = data.dp_overhead_str || '7% ~ 15%';
-                    document.getElementById('active-kangaroos').innerText = data.active_kangaroos_m || '16.0M+';
+                    document.getElementById('dp-overhead').innerText = data.dp_overhead_str || '12%';
+                    if (document.getElementById('dp-overhead-subtext')) {
+                        document.getElementById('dp-overhead-subtext').innerText = data.k_subtext_str || 'K ≈ 1.28 (12% Overhead)';
+                    }
+                    document.getElementById('active-kangaroos').innerText = data.active_kangaroos_m || '0.0M';
                     document.getElementById('active-gpus-subtext').innerText = (data.total_gpus_count || 0) + ' GPUs (' + (data.active_workers_count || 0) + ' containers)';
                     document.getElementById('job-uptime').innerText = data.active_job_uptime || '0h 0m';
                     document.getElementById('keys-tested').innerText = data.keys_zetta_str || '0 Zetakeys';
