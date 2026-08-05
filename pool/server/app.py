@@ -444,19 +444,19 @@ PUZZLE_PRESETS = {
         "pubkey": "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640",
         "bits": 140,
         "base_start": "80000000000000000000000000000000000",
-        "chunk_bits": 78   # ~15-25 min por chunk em 2x RTX 5090 — feedback rápido e progresso constante
+        "chunk_bits": 80   # ~3-5 min por chunk em 2x RTX 5090
     },
     145: {
         "pubkey": "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5",
         "bits": 145,
         "base_start": "1000000000000000000000000000000000000",
-        "chunk_bits": 78
+        "chunk_bits": 80
     },
     150: {
         "pubkey": "03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49",
         "bits": 150,
         "base_start": "20000000000000000000000000000000000000",
-        "chunk_bits": 78
+        "chunk_bits": 80
     }
 }
 
@@ -762,8 +762,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             active_kangaroos_str = "0.0M"
 
         # Cálculo dinâmico do K-Factor e DP Overhead empírico (RCKangaroo.cpp)
-        chunk_bits = 78
-        dp_bits = 16
+        chunk_bits = 80
+        dp_bits = 18
         ops_ideal = 1.15 * (2.0 ** (chunk_bits / 2.0))
         dp_val = float(1 << dp_bits)
         sample_kangs = max(1, total_gpus) * 761856
@@ -773,8 +773,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         k_factor = 1.15 + (0.07 + 0.76 / math.sqrt(dps_per_kang)) / (1.0 + 0.30 * dps_per_kang)
         overhead_pct = int(0.5 + 100.0 * (k_factor / 1.15 - 1.0))
 
-        dp_str = "12% ~ 15%"
-        k_subtext_str = "K ≈ 1.28 ~ 1.33 (12% ~ 15% Overhead)"
+        dp_str = f"{overhead_pct}% ~ {overhead_pct + 1}%"
+        k_subtext_str = f"K ≈ {k_factor:.2f} ({overhead_pct}% Overhead)"
 
         cursor.execute("SELECT status, COUNT(*) FROM chunks GROUP BY status")
         chunk_counts = {r[0]: r[1] for r in cursor.fetchall()}
