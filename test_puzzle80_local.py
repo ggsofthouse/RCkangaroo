@@ -8,7 +8,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 def main():
     pubkey = "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"
     base_start = "80000000000000000000"
-    dp_bits = 20
+    dp_bits = 18
     range_bits = 79
     max_ops = 1.62
 
@@ -17,13 +17,17 @@ def main():
     print("==================================================")
 
     root_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = [
-        os.path.join(root_dir, "rckangaroo"),
-        os.path.join(root_dir, "RCKangaroo"),
-        os.path.join(root_dir, "RCKangaroo.exe"),
-        os.path.join(root_dir, "x64", "Release", "RCKangaroo.exe"),
-    ]
-    bin_path = next((p for p in candidates if os.path.exists(p)), None)
+    if sys.platform == "win32":
+        candidates = [
+            os.path.join(root_dir, "x64", "Release", "RCKangaroo.exe"),
+            os.path.join(root_dir, "RCKangaroo.exe")
+        ]
+    else:
+        candidates = [
+            os.path.join(root_dir, "rckangaroo"),
+            os.path.join(root_dir, "RCKangaroo")
+        ]
+    bin_path = next((p for p in candidates if os.path.isfile(p)), None)
 
     if not bin_path:
         print(f"❌ Binário rckangaroo não encontrado na pasta: {root_dir}")

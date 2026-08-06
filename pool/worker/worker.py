@@ -275,7 +275,8 @@ def get_binary_path() -> str:
 
 def enqueue_output(out, q):
     for line in iter(out.readline, ''):
-        q.put(line)
+        if line and line.strip():
+            q.put(line)
     out.close()
 
 def main():
@@ -347,7 +348,7 @@ def main():
                 chunk_id = work["chunk_id"]
                 pubkey = work["pubkey"]
                 start_hex = work["start_hex"]
-                range_bits = work.get("chunk_bits", work["range_bits"])
+                range_bits = work["range_bits"]
                 # dp_bits e max_ops calculados dinamicamente pelo servidor
                 # (dp = max(14, chunk_bits//2 - 2) | max = chunk_bits/range_bits * 2.5)
                 dp_bits = work.get("dp_bits", 31)
@@ -396,16 +397,18 @@ def main():
 
                 last_heartbeat = time.time()
                 found_key = None
+                last_known_dps = 0
 
-                while True:
-                    while True:
-                        try:
-                            line = out_q.get_nowait()
-                        except queue.Empty:
-                            break
-                        
-                        if line:
-                            line_str = line.strip()
+                while proc.poll() is None or not out_q.empty():
+                    try:
+                        line_str = out_q.get_nowait()
+                    except queue.Empty:
+                        time.sleep(0.1)
+                        line_str = None
+                    
+                    if line_str:
+                        if line_str.strip():
+                            line_str = line_str.strip()
                             print(f"[RCK] {line_str}")
 
                             # Parse Hashrate
@@ -421,6 +424,22 @@ def main():
                                     if khs_match:
                                         last_known_mhs = float(khs_match.group(1)) / 1000.0
 
+                            # Parse DPs count
+                            dp_match = re.search(r'DPs:\s*([\d\.]+[KMG]?)', line_str, re.IGNORECASE)
+                            if dp_match:
+                                dp_raw = dp_match.group(1).upper()
+                                try:
+                                    if dp_raw.endswith('K'):
+                                        last_known_dps = int(float(dp_raw[:-1]) * 1000)
+                                    elif dp_raw.endswith('M'):
+                                        last_known_dps = int(float(dp_raw[:-1]) * 1000000)
+                                    elif dp_raw.endswith('G'):
+                                        last_known_dps = int(float(dp_raw[:-1]) * 1000000000)
+                                    else:
+                                        last_known_dps = int(float(dp_raw))
+                                except Exception:
+                                    pass
+
                             # Parse potential solution line from stdout
                             if "PRIVATE KEY:" in line_str:
                                 candidate = line_str.split("PRIVATE KEY:")[-1].strip()
@@ -434,7 +453,8 @@ def main():
                     if time.time() - last_heartbeat >= 30:
                         http_post("/api/worker/heartbeat", {
                             "worker_id": WORKER_ID,
-                            "hashrate_mhs": last_known_mhs
+                            "hashrate_mhs": last_known_mhs,
+                            "dps_count": last_known_dps
                         })
                         last_heartbeat = time.time()
 

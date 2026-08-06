@@ -25,8 +25,8 @@ def main():
     password = env_vars.get("VPS_PASS", "")
 
     puzzle_num = 140
-    range_bits = 90
-    dp_bits = 24
+    range_bits = 139
+    dp_bits = 18
     max_ops = 1.0
     tames_filename = f"tames{puzzle_num}.dat"
 

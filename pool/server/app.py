@@ -7,6 +7,7 @@ import hashlib
 import secrets
 import threading
 import math
+import datetime
 from typing import Dict, List, Optional
 from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -17,10 +18,33 @@ from pydantic import BaseModel
 
 app = FastAPI(title="RCKangaroo Distributed Pool Coordinator", version="6.1")
 
+VPS_LOGS: List[str] = []
+
+def add_vps_log(msg: str):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    entry = f"[{ts}] {msg}"
+    VPS_LOGS.append(entry)
+    if len(VPS_LOGS) > 100:
+        VPS_LOGS.pop(0)
+
+def log_event(msg: str):
+    add_vps_log(msg)
+
+@app.get("/api/logs")
+def get_vps_logs():
+    return {"logs": VPS_LOGS}
+
 @app.get("/worker.py")
 def download_worker_script():
     worker_file = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "worker", "worker.py"))
     return FileResponse(worker_file, media_type="text/x-python", filename="worker.py")
+
+@app.get("/logo.png")
+def serve_logo_image():
+    logo_file = os.path.join(os.path.dirname(__file__), "logo.png")
+    if os.path.exists(logo_file):
+        return FileResponse(logo_file, media_type="image/png")
+    raise HTTPException(status_code=404, detail="Logo file not found")
 
 
 TAMES_DIR = os.path.join(os.path.dirname(__file__), "tames")
@@ -88,6 +112,8 @@ if not WORKER_TOKEN:
         "⛔ WORKER_TOKEN deve estar definido como variável de ambiente. "
         "Configure-o no .env da VPS e no start_worker.sh dos containers."
     )
+
+WORKER_ALIVE_SECONDS = 120
 
 def verify_worker_token(request: Request):
     """Dependência usada em todos os endpoints de worker para validar o token."""
@@ -288,6 +314,11 @@ def init_db():
         except Exception:
             pass
 
+        try:
+            cursor.execute("ALTER TABLE workers ADD COLUMN dps_count INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         # Adiciona colunas de controle de conclusão real nos chunks
         chunks_cols = [
             ("completed_at", "REAL"),
@@ -371,6 +402,7 @@ class WorkerRegisterRequest(BaseModel):
 class WorkerHeartbeatRequest(BaseModel):
     worker_id: str
     hashrate_mhs: float
+    dps_count: Optional[int] = 0
 
 class WorkRequest(BaseModel):
     worker_id: str
@@ -444,7 +476,7 @@ PUZZLE_PRESETS = {
         "pubkey": "031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640",
         "bits": 140,
         "base_start": "80000000000000000000000000000000000",
-        "chunk_bits": 80   # ~3-5 min por chunk em 2x RTX 5090
+        "chunk_bits": 90   # ~90 bits por chunk para cobrir a janela ativa de busca
     },
     145: {
         "pubkey": "03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5",
@@ -793,6 +825,25 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 m = (up_sec % 3600) // 60
                 active_job_uptime = f"{h}h {m}m"
 
+        active_dps = sum(w.get('dps_count', 0) for w in workers if w.get('dps_count'))
+        total_dps_cnt = active_dps + int(keys_tested / 262144)
+        if total_dps_cnt == 0 and total_hashrate > 0 and jobs:
+            act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
+            c_time = act_j.get("created_at")
+            if c_time:
+                elapsed_sec = max(0, time.time() - c_time)
+                est_dps = int((total_hashrate * 1_000_000 / 262144.0) * elapsed_sec)
+                total_dps_cnt = max(total_dps_cnt, est_dps)
+
+        if total_dps_cnt >= 1_000_000_000:
+            total_dps_str = f"{total_dps_cnt / 1_000_000_000:.2f}B DPs"
+        elif total_dps_cnt >= 1_000_000:
+            total_dps_str = f"{total_dps_cnt / 1_000_000:.2f}M DPs"
+        elif total_dps_cnt >= 1_000:
+            total_dps_str = f"{total_dps_cnt / 1_000:.1f}K DPs"
+        else:
+            total_dps_str = f"{total_dps_cnt} DPs"
+
         return {
             "active_workers_count": len(workers),
             "total_gpus_count": total_gpus,
@@ -803,7 +854,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "pending_chunks_count": pending_chunks,
             "total_created_chunks": total_created_chunks,
             "active_kangaroos_m": active_kangaroos_str,
-            "dp_overhead_str": dp_str,
+            "dp_overhead_str": total_dps_str,
+            "total_dps_str": total_dps_str,
             "k_subtext_str": k_subtext_str,
             "active_job_uptime": active_job_uptime,
             "keys_tested": keys_tested,
@@ -903,11 +955,18 @@ def heartbeat(req: WorkerHeartbeatRequest, _: None = Depends(verify_worker_token
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE workers SET hashrate_mhs = ?, last_ping = ? WHERE worker_id = ?
-        ''', (req.hashrate_mhs, time.time(), req.worker_id))
+        if req.dps_count and req.dps_count > 0:
+            cursor.execute('''
+                UPDATE workers SET hashrate_mhs = ?, last_ping = ?, dps_count = ? WHERE worker_id = ?
+            ''', (req.hashrate_mhs, time.time(), req.dps_count, req.worker_id))
+        else:
+            cursor.execute('''
+                UPDATE workers SET hashrate_mhs = ?, last_ping = ? WHERE worker_id = ?
+            ''', (req.hashrate_mhs, time.time(), req.worker_id))
         conn.commit()
         conn.close()
+        hr_str = f"{req.hashrate_mhs / 1000.0:.2f} GH/s" if req.hashrate_mhs >= 1000 else f"{req.hashrate_mhs:.1f} MH/s"
+        add_vps_log(f"💾 Progresso Salvo na VPS | Guerreiro: {req.worker_id} | Hashrate: {hr_str} ✅")
     return {"status": "OK"}
 
 @app.post("/api/worker/chunk_heartbeat")
@@ -931,6 +990,8 @@ def chunk_heartbeat(req: ChunkHeartbeatRequest, _: None = Depends(verify_worker_
 
         conn.commit()
         conn.close()
+        hr_str = f"{req.hashrate_mhs / 1000.0:.2f} GH/s" if req.hashrate_mhs >= 1000 else f"{req.hashrate_mhs:.1f} MH/s"
+        add_vps_log(f"💾 Heartbeat & Progresso Salvos na VPS | Sub-bloco: {req.chunk_id} | Guerreiro: {req.worker_id} ({hr_str}) ✅")
     return {"status": "OK"}
 
 @app.post("/api/worker/get_work")
@@ -1006,7 +1067,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         if pending:
             chunk = dict(pending)
             chunk_bits = chunk['range_bits']
-            dp_bits_dynamic = 16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26))
+            dp_bits_dynamic = 18 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
             cursor.execute("""
                 UPDATE chunks 
                 SET status = 'ASSIGNED',
@@ -1080,7 +1141,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             req.worker_id, now, now
         ))
 
-        dp_bits_dynamic = 16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26))
+        dp_bits_dynamic = 18 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
 
         conn.commit()
         conn.close()
@@ -1092,11 +1153,11 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             "chunk_id": chunk_id,
             "job_id": job['job_id'],
             "pubkey": job['pubkey'],
-            "start_hex": chunk_start_hex,
+            "start_hex": job['base_start_hex'],
             "range_bits": job['range_bits'],
             "chunk_bits": chunk_bits,
             "dp_bits": dp_bits_dynamic,
-            "max_ops": "1.0"
+            "max_ops": "1000.0"
         }
 
         # ─── Calcula dp_bits e max_ops dinâmicamente com base no chunk real ────────
@@ -1175,8 +1236,6 @@ def submit_solution(req: SubmitSolutionRequest, _: None = Depends(verify_worker_
         ''', (now, req.worker_id, req.private_key, req.pubkey.lower(), req.chunk_id))
         
         cursor.execute("UPDATE chunks SET status = 'SOLVED' WHERE chunk_id = ?", (req.chunk_id,))
-        cursor.execute("UPDATE workers SET completed_chunks = completed_chunks + 1 WHERE worker_id = ?", (req.worker_id,))
-        
         results_file = os.path.join(os.path.dirname(__file__), "POOL_RESULTS.TXT")
         wif_key = hex_to_wif(req.private_key, compressed=True)
         with open(results_file, "a") as f:
@@ -1197,77 +1256,117 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>RCKangaroo Pool Coordinator Dashboard</title>
-        <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+        <title>RCKangaroo Pool Coordinator | Saiyan Power Level</title>
+        <link rel="icon" type="image/png" href="/logo.png">
+        <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Outfit:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
         <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
         <style>
             :root {
-                --bg-body: #080c14;
-                --bg-card: #101726;
-                --bg-card-hover: #162034;
-                --border-color: #1e293b;
-                --border-glow: rgba(59, 130, 246, 0.25);
+                --bg-body: #060913;
+                --bg-card: #0c1222;
+                --bg-card-hover: #131c35;
+                --border-color: rgba(251, 191, 36, 0.25);
+                --border-glow-gold: rgba(251, 191, 36, 0.5);
+                --border-glow-cyan: rgba(56, 189, 248, 0.5);
                 --text-primary: #f8fafc;
                 --text-secondary: #94a3b8;
                 --text-muted: #64748b;
+                --accent-gold: #fbbf24;
                 --accent-cyan: #38bdf8;
-                --accent-green: #22c55e;
-                --accent-amber: #f59e0b;
-                --accent-purple: #a855f7;
+                --accent-green: #34d399;
+                --accent-purple: #c084fc;
+                --accent-red: #f87171;
             }
 
             body {
                 background-color: var(--bg-body);
+                background-image: 
+                    radial-gradient(circle at 15% 15%, rgba(251, 191, 36, 0.04) 0%, transparent 40%),
+                    radial-gradient(circle at 85% 85%, rgba(56, 189, 248, 0.04) 0%, transparent 40%);
                 color: var(--text-primary);
                 font-family: 'Outfit', -apple-system, sans-serif;
                 min-height: 100vh;
             }
 
-            .glass-card {
-                background: linear-gradient(135deg, rgba(16, 23, 38, 0.95) 0%, rgba(12, 17, 28, 0.98) 100%);
-                border: 1px solid var(--border-color);
-                border-radius: 16px;
-                box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
-                backdrop-filter: blur(12px);
-                transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-            }
-            .glass-card:hover {
-                border-color: var(--border-glow);
-                box-shadow: 0 12px 35px -10px rgba(56, 189, 248, 0.15);
+            .font-saiyan {
+                font-family: 'Orbitron', sans-serif;
+                letter-spacing: 0.04em;
             }
 
-            .stat-card {
+            .glow-gold {
+                text-shadow: none;
+            }
+            .glow-cyan {
+                text-shadow: none;
+            }
+            .glow-green {
+                text-shadow: none;
+            }
+
+            .glass-card {
+                background: #0d1322;
+                border: 1px solid rgba(251, 191, 36, 0.2);
+                border-radius: 14px;
+                box-shadow: 0 4px 20px rgba(0, 0, 0, 0.5);
+                transition: all 0.2s ease;
+            }
+            .glass-card:hover {
+                border-color: rgba(251, 191, 36, 0.4);
+                box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
+            }
+
+            .stat-card-saiyan {
                 position: relative;
                 overflow: hidden;
-                padding: 1.5rem;
+                padding: 1.3rem;
             }
-            .stat-card::before {
+            .stat-card-saiyan::before {
                 content: '';
                 position: absolute;
-                top: 0; left: 0; width: 100%; height: 3px;
-                background: linear-gradient(90deg, transparent, var(--accent-color, var(--accent-cyan)), transparent);
+                top: 0;
+                left: 0;
+                width: 4px;
+                height: 100%;
+                background: var(--accent-color, var(--accent-gold));
             }
+
+            .ki-gauge-bg {
+                height: 6px;
+                background: rgba(30, 41, 59, 0.8);
+                border-radius: 10px;
+                overflow: hidden;
+                margin-top: 10px;
+            }
+            .ki-gauge-fill {
+                height: 100%;
+                background: linear-gradient(90deg, #f59e0b, #fbbf24, #38bdf8);
+                border-radius: 10px;
+                box-shadow: 0 0 10px rgba(251, 191, 36, 0.8);
+                transition: width 0.5s ease;
+            }
+
             .stat-header {
-                font-size: 2.2rem;
-                font-weight: 700;
-                letter-spacing: -0.02em;
+                font-size: 2.1rem;
+                font-weight: 900;
+                font-family: 'Orbitron', sans-serif;
                 color: var(--text-primary);
-                font-family: 'JetBrains Mono', monospace;
+                letter-spacing: -0.01em;
             }
             .stat-title {
                 color: var(--text-secondary);
-                font-size: 0.82rem;
-                font-weight: 600;
+                font-size: 0.78rem;
+                font-weight: 700;
                 text-transform: uppercase;
-                letter-spacing: 0.08em;
-                margin-bottom: 0.5rem;
+                letter-spacing: 0.1em;
+                margin-bottom: 0.4rem;
             }
 
             .section-title {
-                font-size: 1.15rem;
-                font-weight: 700;
+                font-size: 1.25rem;
+                font-weight: 800;
+                font-family: 'Orbitron', sans-serif;
                 color: var(--text-primary);
-                letter-spacing: -0.01em;
+                letter-spacing: 0.02em;
             }
 
             .table-custom {
@@ -1276,12 +1375,13 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 margin-bottom: 0;
             }
             .table-custom th {
-                background-color: rgba(15, 23, 42, 0.8) !important;
-                color: var(--text-secondary) !important;
-                font-size: 0.82rem !important;
-                font-weight: 600 !important;
+                background-color: rgba(10, 15, 30, 0.9) !important;
+                color: var(--accent-gold) !important;
+                font-family: 'Orbitron', sans-serif !important;
+                font-size: 0.78rem !important;
+                font-weight: 700 !important;
                 text-transform: uppercase !important;
-                letter-spacing: 0.06em !important;
+                letter-spacing: 0.08em !important;
                 padding: 1rem 1.2rem !important;
                 border-bottom: 1px solid var(--border-color) !important;
             }
@@ -1293,7 +1393,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 color: var(--text-primary) !important;
             }
             .table-custom tbody tr:hover td {
-                background-color: rgba(30, 41, 59, 0.4) !important;
+                background-color: rgba(30, 41, 59, 0.5) !important;
             }
 
             .font-mono {
@@ -1301,41 +1401,61 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             }
 
             .key-box {
-                background-color: #060911;
-                border: 1px solid var(--border-color);
-                border-radius: 8px;
+                background-color: #040711;
+                border: 1px solid rgba(251, 191, 36, 0.3);
+                border-radius: 10px;
                 padding: 10px 14px;
                 font-family: 'JetBrains Mono', monospace;
                 word-break: break-all;
                 color: var(--accent-cyan);
+                box-shadow: inset 0 0 15px rgba(0, 0, 0, 0.8);
             }
 
             .solved-banner {
-                background: linear-gradient(135deg, rgba(34, 197, 94, 0.15) 0%, rgba(10, 15, 26, 0.95) 100%);
-                border: 2px solid var(--accent-green);
-                box-shadow: 0 0 35px rgba(34, 197, 94, 0.25);
-                border-radius: 16px;
+                background: linear-gradient(135deg, rgba(245, 158, 11, 0.2) 0%, rgba(16, 185, 129, 0.25) 50%, rgba(8, 12, 24, 0.98) 100%);
+                border: 2px solid var(--accent-gold);
+                box-shadow: 0 0 45px rgba(251, 191, 36, 0.35);
+                border-radius: 20px;
             }
 
+            .badge-glow-gold {
+                background: rgba(251, 191, 36, 0.15);
+                color: var(--accent-gold);
+                border: 1px solid rgba(251, 191, 36, 0.4);
+            }
             .badge-glow-cyan {
-                background: rgba(56, 189, 248, 0.12);
+                background: rgba(56, 189, 248, 0.15);
                 color: var(--accent-cyan);
-                border: 1px solid rgba(56, 189, 248, 0.3);
+                border: 1px solid rgba(56, 189, 248, 0.4);
             }
             .badge-glow-green {
-                background: rgba(34, 197, 94, 0.12);
+                background: rgba(52, 211, 153, 0.15);
                 color: var(--accent-green);
-                border: 1px solid rgba(34, 197, 94, 0.3);
-            }
-            .badge-glow-amber {
-                background: rgba(245, 158, 11, 0.12);
-                color: var(--accent-amber);
-                border: 1px solid rgba(245, 158, 11, 0.3);
+                border: 1px solid rgba(52, 211, 153, 0.4);
             }
             .badge-glow-purple {
-                background: rgba(168, 85, 247, 0.12);
+                background: rgba(192, 132, 252, 0.15);
                 color: var(--accent-purple);
-                border: 1px solid rgba(168, 85, 247, 0.3);
+                border: 1px solid rgba(192, 132, 252, 0.4);
+            }
+
+            .kangaroo-logo-container {
+                width: 62px;
+                height: 62px;
+                background: rgba(15, 23, 42, 0.8);
+                border: 2px solid var(--accent-gold);
+                border-radius: 18px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                box-shadow: 0 0 30px rgba(251, 191, 36, 0.3);
+                flex-shrink: 0;
+                overflow: hidden;
+            }
+            .kangaroo-img-anim {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
             }
 
             .pulse-dot {
@@ -1344,13 +1464,13 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                 background-color: var(--accent-green);
                 border-radius: 50%;
                 display: inline-block;
-                box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7);
+                box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7);
                 animation: pulse-green 2s infinite;
             }
             @keyframes pulse-green {
-                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.7); }
-                70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(34, 197, 94, 0); }
-                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+                0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7); }
+                70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(52, 211, 153, 0); }
+                100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
             }
 
             @media (max-width: 768px) {
@@ -1362,29 +1482,31 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
     <body class="p-3 p-md-4">
         <div class="container-fluid max-w-7xl mx-auto">
 
-            <!-- Top Header -->
+            <!-- Top Header (Saiyan Style) -->
             <div class="glass-card p-3 p-md-4 mb-4 d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-3">
                 <div class="d-flex align-items-center gap-3">
-                    <div class="fs-2">🦘</div>
+                    <div class="kangaroo-logo-container">
+                        <img src="/logo.png" alt="RCKangaroo Logo" class="kangaroo-img-anim">
+                    </div>
                     <div>
                         <div class="d-flex align-items-center gap-2">
-                            <h1 class="h4 mb-0 fw-bold tracking-tight">RCKangaroo Pool Coordinator</h1>
+                            <h1 class="h4 mb-0 fw-bold font-saiyan text-warning glow-gold">RCKANGAROO POOL COORDINATOR</h1>
                             <span class="badge badge-glow-green px-2.5 py-1 rounded-pill fs-7 font-semibold">
-                                <span class="pulse-dot me-1"></span> Autenticado
+                                <span class="pulse-dot me-1"></span> ONLINE (WAL)
                             </span>
                         </div>
-                        <span class="text-secondary fs-7">Coordenador Distribuído de Alta Performance — Bitcoin Puzzles</span>
+                        <span class="text-secondary fs-7">⚡ Coordenador Distribuído de Alta Performance — Range Completo (Sem Fatiamento Espacial)</span>
                     </div>
                 </div>
                 <div class="d-flex flex-wrap gap-2">
-                    <button class="btn btn-outline-info btn-sm fw-medium rounded-3 px-3" onclick="openCoverageModal()">
-                        📄 Ver Relatório (COVERAGE.TXT)
+                    <button class="btn btn-outline-warning btn-sm font-saiyan rounded-3 px-3" onclick="openCoverageModal()">
+                        📄 COVERAGE.TXT
                     </button>
-                    <button class="btn btn-outline-danger btn-sm rounded-3 px-3" onclick="clearOldJobs()">
+                    <button class="btn btn-outline-danger btn-sm rounded-3 px-3 fw-semibold" onclick="clearOldJobs()">
                         🗑️ Limpar Jobs
                     </button>
-                    <button class="btn btn-primary btn-sm rounded-3 px-3 fw-semibold bg-blue-600 border-0" onclick="loadStats()">
-                        🔄 Atualizar
+                    <button class="btn btn-warning btn-sm rounded-3 px-3 font-saiyan text-dark fw-bold bg-warning border-0" onclick="loadStats()">
+                        🔄 ATUALIZAR
                     </button>
                 </div>
             </div>
@@ -1392,90 +1514,106 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             <!-- Solved Alert Banner -->
             <div id="solved-solutions-container" class="mb-4"></div>
 
-            <!-- Technical Cluster Stat Cards (2 Rows of 4 Cards) -->
+            <!-- Saiyan Stat Cards (2 Rows of 3 Cards) -->
             <div class="row g-3 mb-4">
-                <!-- 1. Throughput -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-cyan);">
-                        <div class="stat-title">🚀 THROUGHPUT AGREGADO</div>
-                        <div class="stat-header text-info" id="pool-hashrate">0.00 GKeys/s</div>
-                        <div class="fs-7 text-secondary mt-1">Velocidade combinada (passos/s)</div>
+                <!-- 1. PODER DE LUTA (HASHRATE AGREGADO) -->
+                <div class="col-12 col-md-4">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-gold);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">💥 PODER DE LUTA AGREGADO</div>
+                            <span class="badge badge-glow-gold fs-8 font-saiyan">SUPER SAIYAN</span>
+                        </div>
+                        <div class="stat-header text-warning glow-gold mt-1" id="pool-hashrate">0.00 GKeys/s</div>
+                        <div class="fs-7 text-secondary mt-1">Throughput total combinado das GPUs</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" id="ki-gauge-hashrate" style="width: 100%;"></div>
+                        </div>
                     </div>
                 </div>
-                <!-- 2. Chunks Concluídos -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-green);">
-                        <div class="stat-title">✅ CHUNKS CONCLUÍDOS</div>
-                        <div class="stat-header text-success fs-3" id="completed-chunks">0</div>
-                        <div class="fs-7 text-secondary mt-1">Sub-blocos validados com sucesso</div>
+                <!-- 2. ENERGIAS TESTADAS (EXAKEYS & COBERTURA) -->
+                <div class="col-12 col-md-4">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-cyan);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">🔮 ENERGIAS TESTADAS (EXAKEYS)</div>
+                            <span class="badge badge-glow-cyan fs-8 font-saiyan">PUZZLE #140</span>
+                        </div>
+                        <div class="stat-header text-info glow-cyan mt-1" id="keys-tested">0.00 Exakeys</div>
+                        <div class="fs-7 text-secondary mt-1">Soma acumulada de chaves verificadas</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 85%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
+                        </div>
                     </div>
                 </div>
-                <!-- 3. Chunks em Andamento -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-amber);">
-                        <div class="stat-title">🔄 CHUNKS EM ANDAMENTO</div>
-                        <div class="stat-header text-warning fs-3" id="active-chunks-status">0 ativos</div>
-                        <div class="fs-7 text-secondary mt-1" id="chunks-total-subtext">0 gerados no total</div>
-                    </div>
-                </div>
-                <!-- 4. DP Overhead -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-purple);">
-                        <div class="stat-title">🎯 DP OVERHEAD (EFICIÊNCIA)</div>
-                        <div class="stat-header text-purple fs-3" style="color: #c084fc;" id="dp-overhead">12% ~ 15%</div>
-                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">K ≈ 1.28 ~ 1.33 (12% ~ 15% Overhead)</div>
+                <!-- 3. DPs MARCADOS & SALVOS NA VPS -->
+                <div class="col-12 col-md-4">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-purple);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">🦘 DPS MARCADOS & SALVOS NA VPS</div>
+                            <span class="badge badge-glow-purple fs-8 font-saiyan">PUZZLE #140</span>
+                        </div>
+                        <div class="stat-header text-purple mt-1" style="color: #c084fc;" id="dp-overhead">0 DPs</div>
+                        <div class="fs-7 text-secondary mt-1" id="dp-overhead-subtext">Armadilhas registradas permanentemente no SQLite WAL</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 100%; background: linear-gradient(90deg, #9333ea, #c084fc);"></div>
+                        </div>
                     </div>
                 </div>
 
-                <!-- 5. Kangaroos Ativos -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-cyan);">
-                        <div class="stat-title">🧠 KANGAROOS ATIVOS</div>
-                        <div class="stat-header text-info fs-3" id="active-kangaroos">0.0M</div>
+                <!-- 4. GUERREIROS Z (GPUs ATIVAS) -->
+                <div class="col-12 col-md-4">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-green);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">🔥 NODES SAIYAJINS ATIVOS</div>
+                            <span class="badge badge-glow-green fs-8 font-saiyan">WORKERS</span>
+                        </div>
+                        <div class="stat-header text-success glow-green mt-1" id="active-kangaroos">0.0M</div>
                         <div class="fs-7 text-secondary mt-1" id="active-gpus-subtext">0 GPUs operando</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 100%; background: linear-gradient(90deg, #059669, #34d399);"></div>
+                        </div>
                     </div>
                 </div>
-                <!-- 6. Tempo de Processamento -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-green);">
-                        <div class="stat-title">⏱️ TEMPO DE PROCESSAMENTO</div>
-                        <div class="stat-header text-success fs-3" id="job-uptime">0h 0m</div>
-                        <div class="fs-7 text-secondary mt-1">Duração da execução ativa</div>
+                <!-- 5. CRONÔMETRO SAIYAJIN & ESTIMATIVA -->
+                <div class="col-12 col-md-4">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-gold);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">⏱️ TEMPO ATIVO & PROBABILIDADE</div>
+                            <span class="badge badge-glow-gold fs-8 font-saiyan">TEMPO RECRUTADO</span>
+                        </div>
+                        <div class="stat-header text-warning mt-1" id="job-uptime">0h 0m</div>
+                        <div class="fs-7 text-secondary mt-1">Duração da sessão ativa na Pool</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 75%; background: linear-gradient(90deg, #d97706, #fbbf24);"></div>
+                        </div>
                     </div>
                 </div>
-                <!-- 7. Chaves Testadas -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-amber);">
-                        <div class="stat-title">🔑 CHAVES TESTADAS (ZETAKEYS)</div>
-                        <div class="stat-header text-warning fs-3" id="keys-tested">0 Zetakeys</div>
-                        <div class="fs-7 text-secondary mt-1">Soma acumulada das chaves</div>
-                    </div>
-                </div>
-                <!-- 8. Checkpoints & Estado -->
-                <div class="col-12 col-sm-6 col-xl-3">
-                    <div class="glass-card stat-card" style="--accent-color: var(--accent-purple);">
-                        <div class="stat-title">📦 CHECKPOINTS & ESTADO</div>
-                        <div class="stat-header text-purple fs-3" style="color: #c084fc;">WAL + Auto</div>
-                        <div class="fs-7 text-secondary mt-1">SQLite WAL + COVERAGE.TXT</div>
+                <!-- 6. ESCUDO VPS & CHUNKS SALVOS -->
+                <div class="col-12 col-md-4">
+                    <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-cyan);">
+                        <div class="d-flex justify-content-between align-items-center">
+                            <div class="stat-title">🛡️ CHUNKS REGISTRADOS NA VPS</div>
+                            <span class="badge badge-glow-cyan fs-8 font-saiyan">SQLITE WAL</span>
+                        </div>
+                        <div class="stat-header text-info mt-1" id="completed-chunks">0</div>
+                        <div class="fs-7 text-secondary mt-1" id="chunks-total-subtext">0 sub-blocos salvos com segurança</div>
+                        <div class="ki-gauge-bg">
+                            <div class="ki-gauge-fill" style="width: 95%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
+                        </div>
                     </div>
                 </div>
             </div>
 
-            <!-- Live VPS Server Logs Console -->
-            <div class="glass-card p-3 p-md-4 mb-4" style="border: 1px solid rgba(56, 189, 248, 0.25);">
+            <!-- Live VPS Logs Section -->
+            <div class="glass-card p-3 p-md-4 mb-4">
                 <div class="d-flex justify-content-between align-items-center mb-2">
                     <div class="d-flex align-items-center gap-2">
-                        <span class="fs-5">📟</span>
-                        <h2 class="section-title mb-0">Logs em Tempo Real da VPS</h2>
-                        <span class="badge badge-glow-green px-2.5 py-1 rounded-pill fs-7">
-                            <span class="pulse-dot me-1"></span> Live Feed (VPS)
-                        </span>
+                        <span class="fs-5">🖥️</span>
+                        <h2 class="section-title mb-0 fs-6">Logs em Tempo Real da VPS</h2>
+                        <span class="badge badge-glow-green px-2 py-0.5 fs-8">Live Feed (VPS)</span>
                     </div>
-                    <button class="btn btn-outline-secondary btn-sm rounded-3" onclick="document.getElementById('vps-logs-box').textContent = ''">
-                        🧹 Limpar Console
-                    </button>
+                    <button class="btn btn-sm btn-outline-secondary py-0 px-2 fs-7" onclick="document.getElementById('vps-logs-box').innerText='[Log limpo pelo usuário.]'">🧹 Limpar Console</button>
                 </div>
-                <div id="vps-logs-box" class="font-mono p-3 rounded-3 fs-7" style="background-color: #030712; color: #38bdf8; border: 1px solid #1e293b; max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">[Aguardando atividade dos workers na VPS...]</div>
+                <div id="vps-logs-box" class="font-mono p-3 rounded-3 fs-7" style="background-color: #030612; color: #34d399; border: 1px solid rgba(52, 211, 153, 0.3); height: 85px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.5;">[Aguardando atividade dos guerreiros na VPS...]</div>
             </div>
 
             <!-- Active Target Puzzle Card -->
@@ -1485,24 +1623,24 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             <div class="glass-card p-3 p-md-4 mb-4">
                 <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
                     <div>
-                        <h2 class="section-title mb-0">💻 Workers Ativos & Faixas Atribuídas</h2>
-                        <span class="text-secondary fs-7">Lista em tempo real das GPUs trabalhando agora</span>
+                        <h2 class="section-title mb-0">🔥 Guerreiros Z (Workers & GPUs Ativas)</h2>
+                        <span class="text-secondary fs-7">Lista em tempo real dos nós processando no Range Completo</span>
                     </div>
-                    <span class="badge badge-glow-cyan px-3 py-1.5 rounded-pill fs-7">
-                        Atualização Automática (3s)
+                    <span class="badge badge-glow-cyan px-3 py-1.5 rounded-pill fs-7 font-mono">
+                        Auto-Update: 3s
                     </span>
                 </div>
                 <div class="table-responsive">
                     <table class="table table-custom align-middle">
                         <thead>
                             <tr>
-                                <th>Worker ID / Nome</th>
+                                <th>Guerreiro / Worker ID</th>
                                 <th>Hardware GPU</th>
-                                <th>Hashrate</th>
+                                <th>Poder de Luta (Hashrate)</th>
                                 <th>Faixa Atribuída (%)</th>
                                 <th>Sub-bloco Hex Atual</th>
-                                <th>Chunks Concluídos</th>
-                                <th>Status (Último Ping)</th>
+                                <th>Chunks Validados</th>
+                                <th>Status (Ping)</th>
                             </tr>
                         </thead>
                         <tbody id="workers-table-body">
@@ -1515,11 +1653,11 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             <div class="glass-card p-3 p-md-4">
                 <div class="d-flex justify-content-between align-items-center mb-3">
                     <div>
-                        <h2 class="section-title mb-0">📋 Jobs de Busca Cadastrados</h2>
-                        <span class="text-secondary fs-7">Gerenciamento de intervalos ativos e resolvidos</span>
+                        <h2 class="section-title mb-0">📋 Puzzles & Jobs de Busca Cadastrados</h2>
+                        <span class="text-secondary fs-7">Gerenciamento de alvos e progresso salvo na VPS</span>
                     </div>
-                    <span class="badge bg-dark border border-secondary text-success rounded-3 px-3 py-1.5 fs-7">
-                        🔒 Progresso Protegido na VPS (WAL)
+                    <span class="badge bg-dark border border-warning text-warning rounded-3 px-3 py-1.5 fs-7 font-mono">
+                        🔒 Proteção SQLite WAL Ativa
                     </span>
                 </div>
                 <div class="table-responsive">
@@ -1531,7 +1669,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                 <th>Chave Pública Alvo</th>
                                 <th>Faixa Executada (%)</th>
                                 <th>Start Offset Hex</th>
-                                <th>Range</th>
+                                <th>Range Bits</th>
                                 <th>Status</th>
                                 <th>Ações</th>
                             </tr>
@@ -1544,18 +1682,6 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
         </div>
 
         <script>
-            const presets = {
-                '40': { pubkey: '03a2efa402fd5268400c77c20e574ba86409ededee7c4020e4b9f0edbee53de0d4', bits: 40, base_start: '8000000000', btc_address: '122vYBWuKDodGYuBwAjBYwfst8ewL6pnjQ' },
-                '50': { pubkey: '03f46f41027bbf44fafd6b059091b900dad41e6845b2241dc3254c7cdd3c5a16c6', bits: 50, base_start: '200000000000', btc_address: '172W6cD98Vj2Pn126nZxPvEyc288eP8p39' },
-                '60': { pubkey: '0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d', bits: 60, base_start: '800000000000000', btc_address: '16jY7qLJn2yGwhmMvVbEFTHmyCpNXnBLvi' },
-                '66': { pubkey: '024ee2be2d4e9f92d2f5a4a03058617dc45befe22938feed5b7a6b7282dd74cbdd', bits: 66, base_start: '20000000000000000', btc_address: '13zb1hQbWVsc2S7ZTGarEbrmcHbotPhvqD' },
-                '130': { pubkey: '03633cbe3ec02b9401c5effa144c5b4d22f87940259634858fc7e59b1c09937852', bits: 130, base_start: '20000000000000000000000000000000', btc_address: '1LHtnPD8vUPG2NRSsfTQ5zWbX2SLW23yAs' },
-                '135': { pubkey: '02145d2611c823a396ef6712ce0f712f09b9b4f3135e3e0aa3230fb9b6d08d1e16', bits: 135, base_start: '4000000000000000000000000000000004', btc_address: '16R2y56L7bg69U5d76D491j2vV6yS451z4' },
-                '140': { pubkey: '031f6a332d3c5c4f2de2378c012f429cd109ba07d69690c6c701b6bb87860d6640', bits: 140, base_start: '80000000000000000000000000000000000', btc_address: '1QKBaU6WAeycb3DbKbLBkX7vJiaS8r42Xo' },
-                '145': { pubkey: '03afdda497369e219a2c1c369954a930e4d3740968e5e4352475bcffce3140dae5', bits: 145, base_start: '1000000000000000000000000000000000000', btc_address: '12vX5yS451z5PD3vW9n5C1x46y1N4C74y' },
-                '150': { pubkey: '03137807790ea7dc6e97901c2bc87411f45ed74a5629315c4e4b03a0a102250c49', bits: 150, base_start: '20000000000000000000000000000000000000', btc_address: '19vX5yS451z5PD3vW9n5C1x46y1N4C74z' }
-            };
-
             function copyText(str) {
                 navigator.clipboard.writeText(str);
                 alert("Copiado para a área de transferência!");
@@ -1586,8 +1712,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
 
                     document.getElementById('pool-hashrate').innerText = data.total_pool_hashrate_ghs + ' GKeys/s';
                     document.getElementById('completed-chunks').innerText = (data.total_completed_chunks || 0).toLocaleString() + ' chunks';
-                    document.getElementById('active-chunks-status').innerText = (data.assigned_chunks_count || 0) + ' ativos';
-                    document.getElementById('chunks-total-subtext').innerText = (data.total_created_chunks || 0) + ' gerados no total';
+                    document.getElementById('chunks-total-subtext').innerText = (data.total_created_chunks || 0) + ' sub-blocos salvos com segurança';
                     document.getElementById('dp-overhead').innerText = data.dp_overhead_str || '12%';
                     if (document.getElementById('dp-overhead-subtext')) {
                         document.getElementById('dp-overhead-subtext').innerText = data.k_subtext_str || 'K ≈ 1.28 (12% Overhead)';
@@ -1595,19 +1720,22 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     document.getElementById('active-kangaroos').innerText = data.active_kangaroos_m || '0.0M';
                     document.getElementById('active-gpus-subtext').innerText = (data.total_gpus_count || 0) + ' GPUs (' + (data.active_workers_count || 0) + ' containers)';
                     document.getElementById('job-uptime').innerText = data.active_job_uptime || '0h 0m';
-                    document.getElementById('keys-tested').innerText = data.keys_zetta_str || '0 Zetakeys';
+                    document.getElementById('keys-tested').innerText = data.keys_zetta_str || '0 Exakeys';
 
-                    // Solved Banner
+                    // Solved Banner (Super Saiyan Dragon Ball Theme)
                     const solvedContainer = document.getElementById('solved-solutions-container');
                     const solvedJobs = data.jobs.filter(j => j.status === 'SOLVED');
 
                     if (solvedJobs.length > 0) {
                         solvedContainer.innerHTML = solvedJobs.map(sj => `
-                            <div class="glass-card solved-banner p-4 mb-3">
+                            <div class="glass-card solved-banner p-4 mb-4">
                                 <div class="d-flex justify-content-between align-items-center mb-3">
-                                    <h3 class="text-success fw-bold mb-0 fs-4">🎉 CHAVE PRIVADA ENCONTRADA!</h3>
+                                    <div class="d-flex align-items-center gap-2">
+                                        <span class="fs-2">🐉⭐</span>
+                                        <h3 class="text-warning font-saiyan fw-bold mb-0 fs-3 glow-gold">DESEJO CONCEDIDO! CHAVE PRIVADA ENCONTRADA!</h3>
+                                    </div>
                                     <div>
-                                        <span class="badge badge-glow-green fs-6 me-2">${sj.solved_at_str || 'Recente'}</span>
+                                        <span class="badge badge-glow-gold fs-6 me-2 font-mono">${sj.solved_at_str || 'Recente'}</span>
                                         <button class="btn btn-outline-danger btn-sm font-semibold" onclick="deleteSingleJob('${sj.job_id}')">🗑️ Apagar Este Resultado</button>
                                     </div>
                                 </div>
@@ -1617,20 +1745,20 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                         <div class="key-box text-info">${sj.pubkey}</div>
                                     </div>
                                     <div class="col-md-6">
-                                        <div class="stat-title">ENCONTRADA POR WORKER:</div>
+                                        <div class="stat-title">ENCONTRADA POR WARRIOR:</div>
                                         <div class="key-box text-warning">${sj.solved_by || 'Desconhecido'}</div>
                                     </div>
                                     <div class="col-md-12">
                                         <div class="d-flex justify-content-between align-items-center mb-1">
-                                            <div class="stat-title">CHAVE PRIVADA (HEX):</div>
-                                            <button class="btn btn-sm btn-outline-success" onclick="copyText('${sj.private_key_hex}')">📋 Copiar HEX</button>
+                                            <div class="stat-title text-success font-semibold">CHAVE PRIVADA (HEX):</div>
+                                            <button class="btn btn-sm btn-outline-success font-mono" onclick="copyText('${sj.private_key_hex}')">📋 Copiar HEX</button>
                                         </div>
                                         <div class="key-box text-success fw-bold fs-5">${sj.private_key_hex}</div>
                                     </div>
                                     <div class="col-md-12">
                                         <div class="d-flex justify-content-between align-items-center mb-1">
-                                            <div class="stat-title">CHAVE PRIVADA (FORMATO WIF COMPRESSADO):</div>
-                                            <button class="btn btn-sm btn-outline-success" onclick="copyText('${sj.wif_compressed}')">📋 Copiar WIF</button>
+                                            <div class="stat-title text-warning font-semibold">CHAVE PRIVADA (FORMATO WIF COMPRESSADO):</div>
+                                            <button class="btn btn-sm btn-outline-warning font-mono" onclick="copyText('${sj.wif_compressed}')">📋 Copiar WIF</button>
                                         </div>
                                         <div class="key-box text-warning fw-bold fs-5">${sj.wif_compressed}</div>
                                     </div>
@@ -1644,25 +1772,25 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     // Render Active Workers & Their Live Started Ranges
                     const workersBody = document.getElementById('workers-table-body');
                     if (data.workers.length === 0) {
-                        workersBody.innerHTML = `<tr><td colspan="7" class="text-center text-secondary p-4">Nenhum worker ativo no momento. Ao conectar um worker (local/Vast.ai), a faixa dele aparecerá aqui automaticamente.</td></tr>`;
+                        workersBody.innerHTML = `<tr><td colspan="7" class="text-center text-secondary p-4">Nenhum guerreiro ativo no momento. Ao conectar um worker (local/Vast.ai), o poder dele aparecerá aqui automaticamente.</td></tr>`;
                     } else {
                         workersBody.innerHTML = data.workers.map(w => {
                             const hrStr = w.hashrate_mhs >= 1000 ? (w.hashrate_mhs / 1000.0).toFixed(2) + ' GH/s' : w.hashrate_mhs.toFixed(2) + ' MH/s';
                             const chunksBadge = w.completed_chunks > 0 ?
-                                `<span class="badge badge-glow-green px-3 py-1 fw-bold">${w.completed_chunks} chunks</span>` :
-                                `<span class="badge bg-dark text-secondary px-2 py-1">${w.completed_chunks} chunks</span>`;
-                            const rangeBadge = `<span class="badge badge-glow-cyan font-mono px-3 py-1.5 fw-semibold" style="font-size: 0.9rem;">${w.assigned_range || '0% → 100%'}</span>`;
+                                `<span class="badge badge-glow-green px-3 py-1 fw-bold font-mono">${w.completed_chunks} chunks</span>` :
+                                `<span class="badge bg-dark text-secondary px-2 py-1 font-mono">${w.completed_chunks} chunks</span>`;
+                            const rangeBadge = `<span class="badge badge-glow-cyan font-mono px-3 py-1.5 fw-semibold" style="font-size: 0.88rem;">${w.assigned_range || '0% → 100%'}</span>`;
                             const hexBadge = `<span class="badge bg-black border border-secondary text-info font-mono px-2 py-1">${w.current_start_hex || 'Iniciando...'}</span>`;
                             const pingSecs = Math.max(0, Math.round(Date.now()/1000 - w.last_ping));
                             
                             return `
                             <tr>
                                 <td>
-                                    <strong class="text-light fs-6">${w.name}</strong><br>
+                                    <strong class="text-warning font-saiyan fs-6 glow-gold">${w.name}</strong><br>
                                     <code class="text-secondary fs-7 font-mono">${w.worker_id}</code>
                                 </td>
-                                <td><span class="text-secondary fs-7">${w.gpu_info}</span></td>
-                                <td style="color: var(--accent-cyan); font-weight: 700; font-family: 'JetBrains Mono', monospace;">${hrStr}</td>
+                                <td><span class="text-light fs-7 fw-semibold">${w.gpu_info}</span></td>
+                                <td style="color: var(--accent-gold); font-weight: 800; font-family: 'Orbitron', sans-serif;" class="fs-6">${hrStr}</td>
                                 <td>${rangeBadge}</td>
                                 <td>${hexBadge}</td>
                                 <td>${chunksBadge}</td>
@@ -1685,16 +1813,16 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         const rangeBadges = activeJobs.map(j => `<span class="badge badge-glow-cyan font-mono me-1 mb-1" title="Job ${j.job_id}">${j.start_percent.toFixed(1)}% → ${j.end_percent.toFixed(1)}%</span>`).join('');
 
                         targetContainer.innerHTML = `
-                            <div class="glass-card p-4 border border-info">
+                            <div class="glass-card p-4 border border-warning">
                                 <div class="d-flex flex-column flex-md-row justify-content-between align-items-md-center gap-2 mb-3">
                                     <div class="d-flex align-items-center">
                                         <span class="fs-3 me-2">🎯</span>
-                                        <h3 class="mb-0 text-info fw-bold h4">${firstActive.puzzle_name}</h3>
+                                        <h3 class="mb-0 text-warning font-saiyan fw-bold h4 glow-gold">${firstActive.puzzle_name}</h3>
                                         <span class="badge badge-glow-green ms-3 fs-7">Em Busca Ativa (${activeJobs.length} Jobs Simultâneos)</span>
                                     </div>
                                     <div class="d-flex flex-wrap align-items-center gap-2">
                                         <span class="badge bg-black border border-secondary text-light fs-7 font-mono">Range Total: ${minStart.toFixed(1)}% → ${maxEnd.toFixed(1)}%</span>
-                                        <span class="badge badge-glow-purple fs-7">Chunks Concluídos: ${totalCompleted} / ${totalAssigned}</span>
+                                        <span class="badge badge-glow-purple fs-7 font-mono">Chunks Concluídos: ${totalCompleted} / ${totalAssigned}</span>
                                     </div>
                                 </div>
                                 <div class="mb-3">
@@ -1706,14 +1834,14 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                         <div class="stat-title">CHAVE PÚBLICA ALVO (PUBLIC KEY):</div>
                                         <div class="d-flex align-items-center mt-1">
                                             <div class="key-box text-info flex-grow-1 me-2 fs-7">${firstActive.pubkey}</div>
-                                            <button class="btn btn-sm btn-outline-info" onclick="copyText('${firstActive.pubkey}')">📋 Copiar</button>
+                                            <button class="btn btn-sm btn-outline-info font-mono" onclick="copyText('${firstActive.pubkey}')">📋 Copiar</button>
                                         </div>
                                     </div>
                                     <div class="col-md-6">
                                         <div class="stat-title">ENDEREÇO BITCOIN ALVO:</div>
                                         <div class="d-flex align-items-center mt-1">
-                                            <div class="key-box text-warning flex-grow-1 me-2 fs-7 font-semibold" style="color: var(--accent-amber);">${firstActive.btc_address}</div>
-                                            <button class="btn btn-sm btn-outline-warning" onclick="copyText('${firstActive.btc_address}')">📋 Copiar</button>
+                                            <div class="key-box text-warning flex-grow-1 me-2 fs-7 font-semibold" style="color: var(--accent-gold);">${firstActive.btc_address}</div>
+                                            <button class="btn btn-sm btn-outline-warning font-mono" onclick="copyText('${firstActive.btc_address}')">📋 Copiar</button>
                                         </div>
                                     </div>
                                 </div>
@@ -1731,7 +1859,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         jobsBody.innerHTML = data.jobs.map(j => `
                             <tr>
                                 <td>
-                                    <strong class="text-info">${j.puzzle_name}</strong><br>
+                                    <strong class="text-warning font-saiyan">${j.puzzle_name}</strong><br>
                                     <code class="text-secondary fs-7 font-mono">${j.job_id}</code>
                                 </td>
                                 <td>
@@ -1744,21 +1872,34 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                 <td><span class="badge badge-glow-cyan font-mono">${j.start_percent}% → ${j.end_percent}%</span></td>
                                 <td><code class="font-mono text-secondary">0x${j.start_hex}</code></td>
                                 <td>
-                                    <span class="font-mono">${j.range_bits} bits</span><br>
+                                    <span class="font-mono text-light">${j.range_bits} bits</span><br>
                                     <span class="badge badge-glow-purple fs-7 font-mono">${j.completed_chunks} / ${j.total_chunks_assigned} chunks</span>
                                 </td>
-                                <td><span class="badge ${j.status === 'SOLVED' ? 'badge-glow-green' : 'badge-glow-cyan'}">${j.status}</span></td>
+                                <td><span class="badge ${j.status === 'SOLVED' ? 'badge-glow-green' : 'badge-glow-cyan'} font-mono">${j.status}</span></td>
                                 <td class="font-mono">
                                     ${j.status === 'SOLVED' ? `
                                         <span class="text-success font-semibold me-2">${j.private_key_hex}</span>
                                         <button class="btn btn-sm btn-outline-success" onclick="copyText('${j.private_key_hex}')">📋 Copiar</button>
                                     ` : `
-                                        <span class="badge badge-glow-green fs-7">🟢 Protegido & Ativo</span>
+                                        <span class="badge badge-glow-green fs-7 font-mono">🟢 Protegido</span>
                                     `}
                                 </td>
                             </tr>
                         `).join('');
                     }
+
+                    // Logs da VPS em Tempo Real
+                    try {
+                        const logsRes = await fetch('/api/logs');
+                        if (logsRes.ok) {
+                            const logsData = await logsRes.json();
+                            const logsBox = document.getElementById('vps-logs-box');
+                            if (logsBox && logsData.logs && logsData.logs.length > 0) {
+                                logsBox.innerText = logsData.logs.join('\\n');
+                                logsBox.scrollTop = logsBox.scrollHeight;
+                            }
+                        }
+                    } catch(e) {}
 
                 } catch (e) {
                     console.error('Erro ao carregar dados:', e);
@@ -1784,20 +1925,20 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
         <!-- Coverage Report Modal -->
         <div class="modal fade" id="coverageModal" tabindex="-1" aria-hidden="true">
             <div class="modal-dialog modal-lg modal-dialog-centered">
-                <div class="modal-content glass-card border border-info shadow-lg">
+                <div class="modal-content glass-card border border-warning shadow-lg">
                     <div class="modal-header border-secondary">
-                        <h5 class="modal-title text-info font-semibold">📄 Relatório de Cobertura & Anti-Sobreposição (COVERAGE.TXT)</h5>
+                        <h5 class="modal-title text-warning font-saiyan font-semibold glow-gold">📄 Relatório de Cobertura (COVERAGE.TXT)</h5>
                         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
                     </div>
                     <div class="modal-body">
                         <div class="mb-3">
-                            <span class="text-secondary fs-7">Este relatório é gerado automaticamente na VPS (`/opt/rckangaroo/pool/server/COVERAGE.TXT`) para evitar retrabalho e mostrar faixas livres:</span>
+                            <span class="text-secondary fs-7">Relatório oficial gerado na VPS (`/opt/rckangaroo/pool/server/COVERAGE.TXT`) garantindo anti-sobreposição de faixas:</span>
                         </div>
                         <pre id="coverage-report-content" class="bg-black text-success p-3 rounded-3 border border-secondary font-mono" style="white-space: pre-wrap; font-size: 0.88rem; max-height: 400px; overflow-y: auto;"></pre>
                     </div>
                     <div class="modal-footer border-secondary">
                         <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Fechar</button>
-                        <a href="/api/coverage" target="_blank" class="btn btn-sm btn-outline-info">📥 Abrir COVERAGE.TXT Direto</a>
+                        <a href="/api/coverage" target="_blank" class="btn btn-sm btn-outline-warning font-mono">📥 Abrir COVERAGE.TXT Direto</a>
                     </div>
                 </div>
             </div>
