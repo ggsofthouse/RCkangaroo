@@ -853,11 +853,20 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         else:
             total_dps_str = f"{total_dps_cnt} DPs"
 
+        dps_per_sec = int(total_hashrate * 1_000_000 / (2**dp_bits))
+        if dps_per_sec >= 1_000_000:
+            dps_per_sec_str = f"{dps_per_sec / 1_000_000:.2f}M DPs/s"
+        elif dps_per_sec >= 1_000:
+            dps_per_sec_str = f"{dps_per_sec / 1_000:.1f}K DPs/s"
+        else:
+            dps_per_sec_str = f"{dps_per_sec} DPs/s"
+
         return {
             "active_workers_count": len(workers),
             "total_gpus_count": total_gpus,
             "total_pool_hashrate_mhs": round(total_hashrate, 2),
             "total_pool_hashrate_ghs": round(total_hashrate / 1000.0, 3),
+            "dps_per_sec_str": dps_per_sec_str,
             "total_completed_chunks": total_completed_chunks,
             "assigned_chunks_count": assigned_chunks,
             "pending_chunks_count": pending_chunks,
@@ -1596,15 +1605,15 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         </div>
                     </div>
                 </div>
-                <!-- 6. ESCUDO VPS & CHUNKS SALVOS -->
+                <!-- 6. TAXA DE DPS & EFICIÊNCIA K -->
                 <div class="col-12 col-md-4">
                     <div class="glass-card stat-card-saiyan" style="--accent-color: var(--accent-cyan);">
                         <div class="d-flex justify-content-between align-items-center">
-                            <div class="stat-title">🛡️ CHUNKS REGISTRADOS NA VPS</div>
-                            <span class="badge badge-glow-cyan fs-8 font-saiyan">SQLITE WAL</span>
+                            <div class="stat-title">⚡ TAXA DE DPS & EFICIÊNCIA K</div>
+                            <span class="badge badge-glow-cyan fs-8 font-saiyan">SOTA V2</span>
                         </div>
-                        <div class="stat-header text-info mt-1" id="completed-chunks">0</div>
-                        <div class="fs-7 text-secondary mt-1" id="chunks-total-subtext">0 sub-blocos salvos com segurança</div>
+                        <div class="stat-header text-info mt-1" id="completed-chunks">0 DPs/s</div>
+                        <div class="fs-7 text-secondary mt-1" id="chunks-total-subtext">Eficiência ideal K ≈ 1.15 (0% DP Overhead)</div>
                         <div class="ki-gauge-bg">
                             <div class="ki-gauge-fill" style="width: 95%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
                         </div>
@@ -1720,14 +1729,14 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     const data = await res.json();
 
                     document.getElementById('pool-hashrate').innerText = data.total_pool_hashrate_ghs + ' GKeys/s';
-                    document.getElementById('completed-chunks').innerText = (data.total_completed_chunks || 0).toLocaleString() + ' chunks';
-                    document.getElementById('chunks-total-subtext').innerText = (data.total_created_chunks || 0) + ' sub-blocos salvos com segurança';
+                    document.getElementById('completed-chunks').innerText = data.dps_per_sec_str || '0 DPs/s';
+                    document.getElementById('chunks-total-subtext').innerText = 'Eficiência ideal K ≈ 1.15 (0% DP Overhead)';
                     document.getElementById('dp-overhead').innerText = data.dp_overhead_str || '12%';
                     if (document.getElementById('dp-overhead-subtext')) {
                         document.getElementById('dp-overhead-subtext').innerText = data.k_subtext_str || 'K ≈ 1.28 (12% Overhead)';
                     }
-                    document.getElementById('active-kangaroos').innerText = data.active_kangaroos_m || '0.0M';
-                    document.getElementById('active-gpus-subtext').innerText = (data.total_gpus_count || 0) + ' GPUs (' + (data.active_workers_count || 0) + ' containers)';
+                    document.getElementById('active-kangaroos').innerText = (data.total_gpus_count || 0) + ' GPUs';
+                    document.getElementById('active-gpus-subtext').innerText = (data.active_kangaroos_m || '0.0M') + ' Kangaroos em execução (' + (data.active_workers_count || 0) + ' containers)';
                     document.getElementById('job-uptime').innerText = data.active_job_uptime || '0h 0m';
                     document.getElementById('keys-tested').innerText = data.keys_zetta_str || '0 Exakeys';
 
