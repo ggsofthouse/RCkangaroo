@@ -764,17 +764,26 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         cursor.execute("SELECT range_bits FROM chunks WHERE status IN ('COMPLETED', 'SOLVED')")
         rows = cursor.fetchall()
         keys_tested = sum(2**int(r[0]) for r in rows)
-        keys_zetta = keys_tested / (10**21)
-        keys_exa   = keys_tested / (10**18)
-        
-        if keys_zetta >= 1_000_000:
-            keys_zetta_str = f"{keys_zetta/1_000_000:.2f} M Zetakeys"
-        elif keys_zetta >= 1_000:
-            keys_zetta_str = f"{keys_zetta/1_000:.2f} K Zetakeys"
-        elif keys_zetta >= 1:
-            keys_zetta_str = f"{keys_zetta:.2f} Zetakeys"
+        keys_tested_live = keys_tested
+        if keys_tested_live == 0 and total_hashrate > 0 and jobs:
+            act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
+            c_time = act_j.get("created_at")
+            if c_time:
+                elapsed_sec = max(0, time.time() - c_time)
+                keys_tested_live = int(total_hashrate * 1_000_000 * elapsed_sec)
+
+        if keys_tested_live >= 10**21:
+            keys_zetta_str = f"{keys_tested_live / (10**21):.2f} Zetakeys"
+        elif keys_tested_live >= 10**18:
+            keys_zetta_str = f"{keys_tested_live / (10**18):.2f} Exakeys"
+        elif keys_tested_live >= 10**15:
+            keys_zetta_str = f"{keys_tested_live / (10**15):.2f} Petakeys"
+        elif keys_tested_live >= 10**12:
+            keys_zetta_str = f"{keys_tested_live / (10**12):.2f} Terakeys"
+        elif keys_tested_live >= 10**9:
+            keys_zetta_str = f"{keys_tested_live / (10**9):.2f} Gigakeys"
         else:
-            keys_zetta_str = f"{keys_exa:.2f} Exakeys"
+            keys_zetta_str = f"{keys_tested_live / (10**6):.2f} Megakeys"
 
         # Cálculo de métricas avançadas do Cluster
         total_gpus = 0
@@ -1067,7 +1076,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         if pending:
             chunk = dict(pending)
             chunk_bits = chunk['range_bits']
-            dp_bits_dynamic = 18 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
+            dp_bits_dynamic = 20 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
             cursor.execute("""
                 UPDATE chunks 
                 SET status = 'ASSIGNED',
@@ -1141,7 +1150,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             req.worker_id, now, now
         ))
 
-        dp_bits_dynamic = 18 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
+        dp_bits_dynamic = 20 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
 
         conn.commit()
         conn.close()

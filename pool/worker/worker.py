@@ -186,7 +186,7 @@ def http_post(endpoint: str, payload: dict, retries: int = 3) -> dict:
             return {}
     return {}
 
-def http_get(endpoint: str) -> dict:
+def http_get(endpoint: str, retries: int = 3) -> dict:
     url = urllib.parse.urljoin(SERVER_URL, endpoint)
     req = urllib.request.Request(
         url,
@@ -194,12 +194,17 @@ def http_get(endpoint: str) -> dict:
             'X-Worker-Token': WORKER_TOKEN
         }
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode('utf-8'))
-    except Exception as e:
-        print(f"❌ HTTP Error connecting to pool server ({url}): {e}")
-        return {}
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode('utf-8'))
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(1)
+                continue
+            print(f"❌ HTTP Error connecting to pool server ({url}): {e}")
+            return {}
+    return {}
 
 def ensure_tames_file(puzzle_number: int, bin_dir: str) -> Optional[str]:
     """Verifica se o servidor da pool possui arquivo de tames pré-gerado para este puzzle.
