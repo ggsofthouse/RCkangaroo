@@ -780,8 +780,12 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             keys_zetta_str = f"{keys_tested_live / (10**12):.2f} Terakeys"
         elif keys_tested_live >= 10**9:
             keys_zetta_str = f"{keys_tested_live / (10**9):.2f} Gigakeys"
+        expected_ops = 1.15 * (2 ** 69.5)
+        prob_pct = (keys_tested_live / expected_ops) * 100.0 if expected_ops > 0 else 0.0
+        if prob_pct < 0.0001 and prob_pct > 0:
+            prob_pct_str = f"{prob_pct:.6f}%"
         else:
-            keys_zetta_str = f"{keys_tested_live / (10**6):.2f} Megakeys"
+            prob_pct_str = f"{prob_pct:.4f}%"
 
         # Cálculo de métricas avançadas do Cluster
         total_gpus = 0
@@ -865,6 +869,7 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "total_pool_hashrate_mhs": round(total_hashrate, 2),
             "total_pool_hashrate_ghs": round(total_hashrate / 1000.0, 3),
             "dps_per_sec_str": dps_per_sec_str,
+            "prob_pct_str": prob_pct_str,
             "total_completed_chunks": total_completed_chunks,
             "assigned_chunks_count": assigned_chunks,
             "pending_chunks_count": pending_chunks,
@@ -1554,7 +1559,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                             <span class="badge badge-glow-cyan fs-8 font-saiyan">PUZZLE #140</span>
                         </div>
                         <div class="stat-header text-info glow-cyan mt-1" id="keys-tested">0.00 Exakeys</div>
-                        <div class="fs-7 text-secondary mt-1">Soma acumulada de chaves verificadas</div>
+                        <div class="fs-7 text-secondary mt-1" id="keys-tested-subtext">Soma acumulada de chaves verificadas</div>
                         <div class="ki-gauge-bg">
                             <div class="ki-gauge-fill" style="width: 85%; background: linear-gradient(90deg, #0284c7, #38bdf8);"></div>
                         </div>
@@ -1737,6 +1742,9 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     document.getElementById('active-gpus-subtext').innerText = (data.active_kangaroos_m || '0.0M') + ' Kangaroos em execução (' + (data.active_workers_count || 0) + ' containers)';
                     document.getElementById('job-uptime').innerText = data.active_job_uptime || '0h 0m';
                     document.getElementById('keys-tested').innerText = data.keys_zetta_str || '0 Exakeys';
+                    if (document.getElementById('keys-tested-subtext')) {
+                        document.getElementById('keys-tested-subtext').innerText = 'Soma acumulada (' + (data.prob_pct_str || '0%') + ' exp. estatística)';
+                    }
 
                     // Solved Banner (Super Saiyan Dragon Ball Theme)
                     const solvedContainer = document.getElementById('solved-solutions-container');
@@ -1792,6 +1800,9 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     } else {
                         workersBody.innerHTML = data.workers.map(w => {
                             const hrStr = w.hashrate_mhs >= 1000 ? (w.hashrate_mhs / 1000.0).toFixed(2) + ' GH/s' : w.hashrate_mhs.toFixed(2) + ' MH/s';
+                            const gCount = w.gpu_info ? Math.max(1, w.gpu_info.split(',').length) : 1;
+                            const perGpuMhs = w.hashrate_mhs / gCount;
+                            const perGpuStr = gCount > 1 ? (perGpuMhs >= 1000 ? ` <br><span class="text-secondary font-mono fs-7">(${(perGpuMhs / 1000.0).toFixed(2)} GH/s/GPU)</span>` : ` <br><span class="text-secondary font-mono fs-7">(${perGpuMhs.toFixed(1)} MH/s/GPU)</span>`) : '';
                             const chunksBadge = w.completed_chunks > 0 ?
                                 `<span class="badge badge-glow-green px-3 py-1 fw-bold font-mono">${w.completed_chunks} chunks</span>` :
                                 `<span class="badge bg-dark text-secondary px-2 py-1 font-mono">${w.completed_chunks} chunks</span>`;
@@ -1806,7 +1817,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                     <code class="text-secondary fs-7 font-mono">${w.worker_id}</code>
                                 </td>
                                 <td><span class="text-light fs-7 fw-semibold">${w.gpu_info}</span></td>
-                                <td style="color: var(--accent-gold); font-weight: 800; font-family: 'Orbitron', sans-serif;" class="fs-6">${hrStr}</td>
+                                <td><span style="color: var(--accent-gold); font-weight: 800; font-family: 'Orbitron', sans-serif;" class="fs-6">${hrStr}</span>${perGpuStr}</td>
                                 <td>${rangeBadge}</td>
                                 <td>${hexBadge}</td>
                                 <td>${chunksBadge}</td>
