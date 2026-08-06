@@ -702,17 +702,15 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                 w_dict['current_range_bits'] = chunk_job['range_bits']
                 w_dict['assigned_range'] = f"{chunk_job['start_percent']}% → {chunk_job['end_percent']}%"
             else:
-                if w_dict.get('current_job_id'):
-                    cursor.execute("SELECT start_percent, end_percent FROM jobs WHERE job_id = ?", (w_dict['current_job_id'],))
-                    cj = cursor.fetchone()
-                    if cj:
-                        w_dict['assigned_range'] = f"{cj['start_percent']}% → {cj['end_percent']}%"
-                    else:
-                        w_dict['assigned_range'] = "0% → 100%"
+                cursor.execute("SELECT start_percent, end_percent, start_hex FROM jobs WHERE status = 'ACTIVE' ORDER BY created_at DESC LIMIT 1")
+                act_job = cursor.fetchone()
+                if act_job:
+                    w_dict['assigned_range'] = f"{act_job['start_percent']}% → {act_job['end_percent']}%"
+                    w_dict['current_start_hex'] = f"0x{act_job['start_hex']}"
                 else:
                     w_dict['assigned_range'] = "0% → 100%"
-                w_dict['current_start_hex'] = "Aguardando tarefa..."
-                w_dict['current_range_bits'] = "-"
+                    w_dict['current_start_hex'] = "0x80000000000000000000000000000000000"
+                w_dict['current_range_bits'] = "139"
 
             cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE (assigned_worker = ? OR assigned_worker LIKE ?) AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'], f"{w_name}%"))
             w_dict['completed_chunks'] = cursor.fetchone()['cnt']
