@@ -942,18 +942,27 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
 
         conn.close()
 
-        # Calcula soma real de chaves e total de chunks concluidos
-        total_completed_chunks = sum(j['completed_chunks'] for j in jobs)
-        cursor = get_db().cursor()
-        # Operações computacionais reais do Kangaroo = 1.15 * 2^(range_bits / 2) por chunk
-        keys_tested = sum(int(1.15 * (2 ** (int(r[0]) / 2.0))) for r in rows)
-        keys_tested_live = keys_tested
-        if keys_tested_live == 0 and total_hashrate > 0 and jobs:
+        # Calcula soma real de chaves e total de DPs no banco global da nuvem
+        total_global_dps_cnt = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+        try:
+            cursor.execute("SELECT COUNT(*) FROM global_dps")
+            db_dp_cnt = cursor.fetchone()[0]
+            if db_dp_cnt > total_global_dps_cnt:
+                total_global_dps_cnt = db_dp_cnt
+        except Exception:
+            pass
+
+        keys_tested_live = 0
+        active_job_uptime = "0h 0m"
+        if total_hashrate > 0 and jobs:
             act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
             c_time = act_j.get("created_at")
             if c_time:
                 elapsed_sec = max(0, time.time() - c_time)
                 keys_tested_live = int(total_hashrate * 1_000_000 * elapsed_sec)
+                h = int(elapsed_sec) // 3600
+                m = (int(elapsed_sec) % 3600) // 60
+                active_job_uptime = f"{h}h {m}m"
 
         if keys_tested_live >= 10**24:
             keys_zetta_str = f"{keys_tested_live / (10**24):.2f} Yottakeys"
@@ -984,73 +993,28 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         for w in workers:
             gpu_str = w.get("gpu_info", "")
             g_cnt = max(1, len([g for g in gpu_str.split(",") if g.strip()])) if gpu_str else 1
+            w["gpu_count"] = g_cnt
             total_gpus += g_cnt
 
-        # Kangaroos Ativos reais alocados (761,856 kangaroos por GPU de 24GB do RCKangaroo)
-        total_kangaroos_cnt = total_gpus * 761856
-        if total_gpus > 0:
-            if total_kangaroos_cnt >= 1_000_000:
-                active_kangaroos_str = f"{total_kangaroos_cnt / 1_000_000:.1f}M"
-            else:
-                active_kangaroos_str = f"{total_kangaroos_cnt / 1_000:.0f}K"
-        else:
-            active_kangaroos_str = "0.0M"
-
-        # Cálculo dinâmico do K-Factor e DP Overhead por Instância Worker (2 GPUs)
-        kangs_per_worker = 2 * 761856  # 1,523,712 kangaroos por container Vast-2x
-        chunk_bits = 80
-        dp_bits = 18
-        ops_ideal = 1.15 * (2.0 ** (chunk_bits / 2.0))
-        dp_val = float(1 << dp_bits)
-        path_single_kang = ops_ideal / kangs_per_worker
-        dps_per_kang = max(0.001, path_single_kang / dp_val)
-
-        k_factor = 1.15 + (0.07 + 0.76 / math.sqrt(dps_per_kang)) / (1.0 + 0.30 * dps_per_kang)
-        overhead_pct = int(0.5 + 100.0 * (k_factor / 1.15 - 1.0))
-
-        dp_str = "12% ~ 15%"
-        k_subtext_str = f"K ≈ {k_factor:.2f} ({overhead_pct}% Média por Instância)"
-
-        cursor.execute("SELECT status, COUNT(*) FROM chunks GROUP BY status")
-        chunk_counts = {r[0]: r[1] for r in cursor.fetchall()}
-        assigned_chunks = chunk_counts.get("ASSIGNED", 0)
-        pending_chunks = chunk_counts.get("PENDING", 0)
-        total_created_chunks = sum(chunk_counts.values())
-
-        # Tempo de processamento do Job ativo mais recente
-        active_job_uptime = "0h 0m"
-        if jobs:
-            act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
-            c_time = act_j.get("created_at")
-            if c_time:
-                up_sec = int(time.time() - c_time)
-                h = up_sec // 3600
-                m = (up_sec % 3600) // 60
-                active_job_uptime = f"{h}h {m}m"
-
-        active_dps = sum(w.get('dps_count', 0) for w in workers if w.get('dps_count'))
-        total_dps_cnt = sum(len(v) for v in GLOBAL_DP_CACHE.values())
-        if total_dps_cnt == 0:
-            total_dps_cnt = active_dps
-
-        if total_dps_cnt >= 1_000_000_000_000:
-            total_dps_str = f"{total_dps_cnt / 1_000_000_000_000:.2f}T DPs"
-        elif total_dps_cnt >= 1_000_000_000:
-            total_dps_str = f"{total_dps_cnt / 1_000_000_000:.2f}B DPs"
-        elif total_dps_cnt >= 1_000_000:
-            total_dps_str = f"{total_dps_cnt / 1_000_000:.2f}M DPs"
-        elif total_dps_cnt >= 1_000:
-            total_dps_str = f"{total_dps_cnt / 1_000:.1f}K DPs"
-        else:
-            total_dps_str = f"{total_dps_cnt} DPs"
-
-        dps_per_sec = int(total_hashrate * 1_000_000 / (2**dp_bits))
+        dp_bits_val = 20
+        dps_per_sec = int(total_hashrate * 1_000_000 / (2**dp_bits_val))
         if dps_per_sec >= 1_000_000:
             dps_per_sec_str = f"{dps_per_sec / 1_000_000:.2f}M DPs/s"
         elif dps_per_sec >= 1_000:
             dps_per_sec_str = f"{dps_per_sec / 1_000:.1f}K DPs/s"
         else:
             dps_per_sec_str = f"{dps_per_sec} DPs/s"
+
+        if total_global_dps_cnt >= 1_000_000_000_000:
+            total_dps_str = f"{total_global_dps_cnt / 1_000_000_000_000:.2f}T DPs"
+        elif total_global_dps_cnt >= 1_000_000_000:
+            total_dps_str = f"{total_global_dps_cnt / 1_000_000_000:.2f}B DPs"
+        elif total_global_dps_cnt >= 1_000_000:
+            total_dps_str = f"{total_global_dps_cnt / 1_000_000:.2f}M DPs"
+        elif total_global_dps_cnt >= 1_000:
+            total_dps_str = f"{total_global_dps_cnt / 1_000:.1f}K DPs"
+        else:
+            total_dps_str = f"{total_global_dps_cnt} DPs"
 
         return {
             "active_workers_count": len(workers),
@@ -1059,21 +1023,13 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "total_pool_hashrate_ghs": round(total_hashrate / 1000.0, 3),
             "dps_per_sec_str": dps_per_sec_str,
             "prob_pct_str": prob_pct_str,
-            "total_completed_chunks": total_completed_chunks,
-            "assigned_chunks_count": assigned_chunks,
-            "pending_chunks_count": pending_chunks,
-            "total_created_chunks": total_created_chunks,
-            "active_kangaroos_m": active_kangaroos_str,
-            "dp_overhead_str": total_dps_str,
-            "total_dps_str": total_dps_str,
-            "k_subtext_str": k_subtext_str,
-            "active_job_uptime": active_job_uptime,
-            "keys_tested": keys_tested,
             "keys_zetta_str": keys_zetta_str,
+            "dp_overhead_str": total_dps_str,
+            "k_subtext_str": f"K ≈ 1.15 (Armadilhas salvas na nuvem: {total_dps_str})",
+            "active_kangaroos_m": f"{(total_gpus * 761856) / 1000000.0:.1f}M",
+            "active_job_uptime": active_job_uptime,
             "workers": workers,
-            "jobs": jobs,
-            "coverage": cov_data,
-            "logs": list(server_logs)
+            "jobs": jobs
         }
 
 # Open Worker Endpoints (Auto-Creates Job if No Active Job Exists)

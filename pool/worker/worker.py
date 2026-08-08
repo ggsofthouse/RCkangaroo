@@ -25,6 +25,32 @@ P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 Gx = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
 Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 
+# Global queue for batching DP streaming entries to pool server
+dp_batch_queue = queue.Queue()
+
+def dp_flusher_loop(worker_name: str, puzzle_number: int):
+    """Background thread that batches DP entries and posts to /api/dp/submit_batch on pool server."""
+    while True:
+        try:
+            batch = []
+            while len(batch) < 500:
+                try:
+                    item = dp_batch_queue.get_nowait()
+                    batch.append(item)
+                except queue.Empty:
+                    break
+            if batch:
+                res = http_post("/api/dp/submit_batch", {
+                    "worker_name": worker_name,
+                    "puzzle_number": puzzle_number,
+                    "dps": batch
+                })
+                if res and res.get("solved"):
+                    print(f"\n🎉 CHAVE ENCONTRADA VIA COLISÃO GLOBAL DE DP! Chave: {res.get('solved_key')}")
+            time.sleep(2.0)
+        except Exception:
+            time.sleep(2.0)
+
 def _point_add(p1, p2):
     if p1 is None: return p2
     if p2 is None: return p1
@@ -359,9 +385,13 @@ def main():
         "end_percent": END_PCT
     })
 
+    # Start background DP flusher thread for cloud streaming
+    flusher_thread = threading.Thread(target=dp_flusher_loop, args=(WORKER_NAME, TARGET_PUZZLE), daemon=True)
+    flusher_thread.start()
+
     while True:
         try:
-            # Request work chunk
+            # Request work job
             work = http_post("/api/worker/get_work", {
                 "worker_id": WORKER_ID,
                 "name": WORKER_NAME,
@@ -379,16 +409,14 @@ def main():
                 continue
 
             if work.get("status") == "WORK_ASSIGNED":
-                chunk_id = work["chunk_id"]
+                chunk_id = work.get("chunk_id", "job_140")
                 pubkey = work["pubkey"]
                 start_hex = work["start_hex"]
                 range_bits = work["range_bits"]
-                # dp_bits e max_ops calculados dinamicamente pelo servidor
-                # (dp = max(14, chunk_bits//2 - 2) | max = chunk_bits/range_bits * 2.5)
                 dp_bits = work.get("dp_bits", 31)
                 max_ops = work.get("max_ops", "1.62")
 
-                print(f"\n🚀 Recebido Sub-bloco de Trabalho: {chunk_id}")
+                print(f"\n🚀 Recebido Trabalho de Busca DP na Nuvem (Puzzle #{TARGET_PUZZLE})")
                 print(f"   Pubkey Alvo:  {pubkey}")
                 print(f"   Start Hex:    0x{start_hex}")
                 print(f"   Range Bits:   {range_bits} bits")
@@ -540,12 +568,12 @@ def main():
                     print("🎉 Solucao enviada ao servidor com sucesso!")
                     break
 
-                # Confirma explicitamente a conclusão do chunk ao servidor
+                # Confirma atualização de progresso contínuo ao servidor
                 http_post("/api/worker/complete_chunk", {
                     "worker_id": WORKER_ID,
                     "chunk_id": chunk_id
                 })
-                print(f"✅ Chunk {chunk_id} concluido e confirmado. Solicitando proximo...\n")
+                print("✅ Sessão de busca em andamento. Renovando conexão...\n")
 
         except KeyboardInterrupt:
             print("\n🛑 Worker interrompido pelo usuario.")
