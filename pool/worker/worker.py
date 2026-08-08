@@ -173,17 +173,9 @@ if sys.stdin and sys.stdin.isatty() and not getattr(args, 'non_interactive', Fal
         else:
             TARGET_PUZZLE = 66
             
-        s_in = input("👉 Porcentagem INICIAL do range (0% a 100%) [0.0]: ").strip()
-        if s_in:
-            START_PCT = float(s_in)
-        else:
-            START_PCT = 0.0
-            
-        e_in = input("👉 Porcentagem FINAL do range (0% a 100%) [100.0]: ").strip()
-        if e_in:
-            END_PCT = float(e_in)
-        else:
-            END_PCT = 100.0
+        s_in = input("👉 Alcance da busca: Range Completo 100% (0.0% a 100.0%) [Pressione ENTER]: ").strip()
+        START_PCT = 0.0
+        END_PCT = 100.0
     except (KeyboardInterrupt, EOFError):
         print("\nSaindo...")
         sys.exit(0)
