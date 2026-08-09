@@ -27,6 +27,7 @@ Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 
 # Global queue for batching DP streaming entries to pool server
 dp_batch_queue = queue.Queue()
+DP_REQUEUE_CAP = 20000
 
 def dp_flusher_loop(worker_name: str, puzzle_number: int):
     """Background thread that batches DP entries and posts to /api/dp/submit_batch on pool server."""
@@ -45,11 +46,25 @@ def dp_flusher_loop(worker_name: str, puzzle_number: int):
                     "puzzle_number": puzzle_number,
                     "dps": batch
                 })
-                if res and res.get("solved"):
-                    print(f"\n🎉 CHAVE ENCONTRADA VIA COLISÃO GLOBAL DE DP! Chave: {res.get('solved_key')}")
+                
+                # Check if submission was successfully ingested by VPS
+                if res and res.get("status") == "ok":
+                    if res.get("solved"):
+                        print(f"\n🎉 CHAVE ENCONTRADA VIA COLISÃO GLOBAL DE DP! Chave: {res.get('private_key')}")
+                else:
+                    # Connection/submission failed — re-queue DPs to prevent data loss
+                    if dp_batch_queue.qsize() < DP_REQUEUE_CAP:
+                        for item in batch:
+                            dp_batch_queue.put(item)
+                        print(f"⚠️ Falha no envio de {len(batch)} DPs para VPS. Re-enfileirados ({dp_batch_queue.qsize()}/{DP_REQUEUE_CAP} pendentes)...")
+                    else:
+                        print(f"⚠️ Limite de re-enfileiramento ({DP_REQUEUE_CAP}) atingido. Descartando lote antigo por segurança de memória.")
+                    time.sleep(5.0)
+                    continue
+
             time.sleep(2.0)
         except Exception:
-            time.sleep(2.0)
+            time.sleep(5.0)
 
 def _point_add(p1, p2):
     if p1 is None: return p2
