@@ -1259,19 +1259,20 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
                 "range_bits": chunk['job_range_bits'],
                 "chunk_bits": chunk_bits,
                 "dp_bits": dp_bits_dynamic,
-                "max_ops": "1.0"
+                "max_ops": "1000.0"
             }
 
-        # === 4. Avança o offset do Job específico do Worker ===
+        # === 4. Avança a sessão de trabalho contínuo do Worker ===
         cursor.execute("UPDATE workers SET current_job_id = ? WHERE worker_id = ?", 
                        (job['job_id'], req.worker_id))
 
         current_offset_int = int(job['current_offset_hex'], 16)
-        chunk_bits = min(job.get('chunk_bits', 78), job['range_bits'])
-        if chunk_bits < 48 and job['range_bits'] >= 48:
-            chunk_bits = 78
+        # session_budget_bits: Orçamento da sessão de busca (NÃO fatia a chave, o worker sempre varre o range completo de 0 a 100%)
+        session_budget_bits = min(job.get('chunk_bits', 80), job['range_bits'])
+        if session_budget_bits < 48 and job['range_bits'] >= 48:
+            session_budget_bits = 80
 
-        chunk_size = 1 << chunk_bits
+        chunk_size = 1 << session_budget_bits
 
         base_start_int = int(job['base_start_hex'], 16)
         total_range_int = 1 << job['range_bits']
@@ -1281,9 +1282,9 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         if current_offset_int >= end_offset_int:
             conn.commit()
             conn.close()
-            return {"status": "NO_WORK", "message": f"Fatia concluída até {end_pct:.2f}%"}
+            return {"status": "NO_WORK", "message": f"Faixa concluída até {end_pct:.2f}%"}
 
-        chunk_id = f"{job['job_id']}_chunk_{hex(current_offset_int)[2:]}"
+        chunk_id = f"{job['job_id']}_session_{hex(current_offset_int)[2:]}"
         chunk_start_hex = hex(current_offset_int)[2:]
         next_offset_hex = hex(current_offset_int + chunk_size)[2:]
 
@@ -1303,16 +1304,24 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
                 status='ASSIGNED',
                 last_heartbeat=excluded.last_heartbeat
         ''', (
-            chunk_id, job['job_id'], chunk_start_hex, chunk_bits,
+            chunk_id, job['job_id'], chunk_start_hex, session_budget_bits,
             req.worker_id, now, now
         ))
 
-        dp_bits_dynamic = 20 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
+        # dp_bits cravado em 18/19 para Puzzle 140 (bits=139) -> Garante K ≈ 1.15 (Overhead < 1%)
+        if job['range_bits'] >= 100:
+            dp_bits_dynamic = 18
+        elif session_budget_bits >= 90:
+            dp_bits_dynamic = 20
+        elif session_budget_bits >= 70:
+            dp_bits_dynamic = 18
+        else:
+            dp_bits_dynamic = min(19, max(14, (session_budget_bits // 2) - 26))
 
         conn.commit()
         conn.close()
 
-        log_event(f"📦 Novo chunk {chunk_id} (bits={chunk_bits}) atribuído a {worker_identifier}")
+        log_event(f"📦 Nova sessão de busca (budget={session_budget_bits}b, dp={dp_bits_dynamic}) atribuída a {worker_identifier}")
 
         return {
             "status": "WORK_ASSIGNED",
@@ -1321,7 +1330,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             "pubkey": job['pubkey'],
             "start_hex": job['base_start_hex'],
             "range_bits": job['range_bits'],
-            "chunk_bits": chunk_bits,
+            "chunk_bits": session_budget_bits,
             "dp_bits": dp_bits_dynamic,
             "max_ops": "1000.0"
         }
