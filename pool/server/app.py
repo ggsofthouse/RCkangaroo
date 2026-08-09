@@ -1121,14 +1121,20 @@ def heartbeat(req: WorkerHeartbeatRequest, _: None = Depends(verify_worker_token
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
+        now = time.time()
         if req.dps_count and req.dps_count > 0:
             cursor.execute('''
                 UPDATE workers SET hashrate_mhs = ?, last_ping = ?, dps_count = ? WHERE worker_id = ?
-            ''', (req.hashrate_mhs, time.time(), req.dps_count, req.worker_id))
+            ''', (req.hashrate_mhs, now, req.dps_count, req.worker_id))
         else:
             cursor.execute('''
                 UPDATE workers SET hashrate_mhs = ?, last_ping = ? WHERE worker_id = ?
-            ''', (req.hashrate_mhs, time.time(), req.worker_id))
+            ''', (req.hashrate_mhs, now, req.worker_id))
+            
+        cursor.execute('''
+            UPDATE chunks SET last_heartbeat = ? WHERE assigned_worker = ? AND status = 'ASSIGNED'
+        ''', (now, req.worker_id))
+
         conn.commit()
         conn.close()
         hr_str = f"{req.hashrate_mhs / 1000.0:.2f} GH/s" if req.hashrate_mhs >= 1000 else f"{req.hashrate_mhs:.1f} MH/s"
