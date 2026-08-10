@@ -6,15 +6,18 @@ import subprocess
 sys.stdout.reconfigure(encoding='utf-8')
 
 def main():
-    pubkey = "0290e6900a58d33393bc1097b5aed31f2e4e7cbd3e5466af958665bc0121248483"
-    base_start = "200000000000000000"
+    puzzle_num = 60
+    pubkey = "0348e843dc5b1bd246e6309b4924b81543d02b16c8083df973a89ce2c7eb89a10d"
+    base_start = "800000000000000"  # 2^59 em Hex
     dp_bits = 14
-    range_bits = 69
-    max_ops = 1.62
+    range_bits = 59
 
     print("==================================================")
-    print("🦘 RCKangaroo — TESTE LOCAL DIRETO (PUZZLE #70)")
+    print(f"🦘 RCKangaroo — TESTE LOCAL DIRETO (PUZZLE #{puzzle_num})")
     print("==================================================")
+    print(f"🔑 Chave Pública: {pubkey}")
+    print(f"📐 Range (Hex)  : {base_start} .. fffffffffffffff (2^59 .. 2^60)")
+    print("--------------------------------------------------")
 
     root_dir = os.path.dirname(os.path.abspath(__file__))
     if sys.platform == "win32":
@@ -39,14 +42,13 @@ def main():
         "-dp", str(dp_bits),
         "-range", str(range_bits),
         "-start", base_start,
-        "-pubkey", pubkey,
-        "-max", str(max_ops)
+        "-pubkey", pubkey
     ]
 
-    print(f"⚙️ Executando busca na GPU:\n   {' '.join(cmd)}\n")
+    print(f"⚙️ Executando busca direta na GPU (SEM LATTICE):\n   {' '.join(cmd)}\n")
     t0 = time.time()
     subprocess.run(cmd, cwd=os.path.dirname(bin_path))
-    print(f"\n✅ Teste concluído em {time.time()-t0:.1f} segundos.")
+    print(f"\n✅ Teste do Puzzle {puzzle_num} concluído em {time.time()-t0:.2f} segundos.")
 
 if __name__ == "__main__":
     main()

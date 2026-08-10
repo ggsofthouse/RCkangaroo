@@ -8,7 +8,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 def main():
     pubkey = "037e1238f7b1ce757df94faa9a2eb261bf0aeb9f84dbf81212104e78931c2a19dc"
     base_start = "80000000000000000000"
-    dp_bits = 18
+    dp_bits = 15
     range_bits = 79
     max_ops = 1.62
 

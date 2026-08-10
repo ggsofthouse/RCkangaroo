@@ -28,6 +28,7 @@ Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 # Global queue for batching DP streaming entries to pool server
 dp_batch_queue = queue.Queue()
 DP_REQUEUE_CAP = 20000
+SUPPORTS_STREAM_DPS = True
 
 def dp_flusher_loop(worker_name: str, puzzle_number: int):
     """Background thread that batches DP entries and posts to /api/dp/submit_batch on pool server."""
@@ -239,35 +240,6 @@ def http_get(endpoint: str, retries: int = 3) -> dict:
             return {}
     return {}
 
-dp_batch_queue = queue.Queue()
-
-def dp_uploader_loop():
-    while True:
-        time.sleep(10)
-        items = []
-        while not dp_batch_queue.empty() and len(items) < 2000:
-            try:
-                items.append(dp_batch_queue.get_nowait())
-            except queue.Empty:
-                break
-        if items:
-            try:
-                res = http_post("/api/dp/submit_batch", {
-                    "worker_name": WORKER_NAME,
-                    "puzzle_number": TARGET_PUZZLE,
-                    "dps": items
-                })
-                if res and res.get("status") == "ok":
-                    total_global = res.get("total_global_dps", 0)
-                    print(f"📦 [DP Pool] Enviou lote de {len(items)} DPs para a VPS. (Total Global no Servidor: {total_global:,})")
-                    if res.get("solved"):
-                        print(f"🎉 COLISÃO GLOBAL CONFIRMADA PELO SERVIDOR! Chave: 0x{res.get('private_key')}")
-            except Exception as e:
-                print(f"⚠️ Erro no upload de lote de DPs: {e}")
-
-_dp_uploader_thread = threading.Thread(target=dp_uploader_loop, daemon=True)
-_dp_uploader_thread.start()
-
 def ensure_tames_file(puzzle_number: int, bin_dir: str) -> Optional[str]:
     """Verifica se o servidor da pool possui arquivo de tames pré-gerado para este puzzle.
     Se sim, baixa para o diretório do binário RCKangaroo.
@@ -347,6 +319,7 @@ def enqueue_output(out, q):
     out.close()
 
 def main():
+    global SUPPORTS_STREAM_DPS
     print(f"\n==================================================")
     print(f"🦘 RCKangaroo Worker Node Iniciado")
     print(f"Servidor Pool: {SERVER_URL}")
@@ -447,9 +420,10 @@ def main():
                     "-range", str(range_bits),
                     "-start", start_hex,
                     "-pubkey", pubkey,
-                    "-max", str(max_ops),
-                    "-stream-dps"
+                    "-max", str(max_ops)
                 ]
+                if SUPPORTS_STREAM_DPS:
+                    cmd.append("-stream-dps")
                 if tame_file:
                     cmd.extend(["-tames", tame_file])
 
@@ -470,72 +444,79 @@ def main():
                 last_known_dps = 0
 
                 while proc.poll() is None or not out_q.empty():
-                    try:
-                        line_str = out_q.get_nowait()
-                    except queue.Empty:
-                        time.sleep(0.1)
-                        line_str = None
-                    
-                    if line_str:
-                        if line_str.strip():
-                            line_str = line_str.strip()
-                            if line_str.startswith("DP_ENTRY:"):
-                                parts = line_str.split(":")
-                                if len(parts) >= 4:
+                    items_processed = 0
+                    while not out_q.empty():
+                        try:
+                            line_str = out_q.get_nowait()
+                            items_processed += 1
+                        except queue.Empty:
+                            break
+                        
+                        if line_str:
+                            if line_str.strip():
+                                line_str = line_str.strip()
+                                if "unknown option -stream-dps" in line_str:
+                                    SUPPORTS_STREAM_DPS = False
+                                    sys.stdout.write("⚠️ Binário local não possui suporte a -stream-dps. Desativando opção no worker...\n")
+                                    sys.stdout.flush()
+                                if line_str.startswith("DP_ENTRY:"):
+                                    parts = line_str.split(":")
+                                    if len(parts) >= 4:
+                                        try:
+                                            dp_type = int(parts[1])
+                                            x_prefix = parts[2]
+                                            dist_hex = parts[3]
+                                            dp_batch_queue.put({
+                                                "x_prefix": x_prefix,
+                                                "dist_hex": dist_hex,
+                                                "dp_type": dp_type
+                                            })
+                                        except Exception:
+                                            pass
+                                else:
+                                    sys.stdout.write(line_str + "\n")
+                                    sys.stdout.flush()
+
+                                # Parse Hashrate
+                                mhs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*MKeys', line_str, re.IGNORECASE)
+                                if mhs_match:
+                                    last_known_mhs = float(mhs_match.group(1))
+                                else:
+                                    ghs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*GKeys', line_str, re.IGNORECASE)
+                                    if ghs_match:
+                                        last_known_mhs = float(ghs_match.group(1)) * 1000.0
+                                    else:
+                                        khs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*KKeys', line_str, re.IGNORECASE)
+                                        if khs_match:
+                                            last_known_mhs = float(khs_match.group(1)) / 1000.0
+
+                                # Parse DPs count
+                                dp_match = re.search(r'DPs:\s*([\d\.]+[KMG]?)', line_str, re.IGNORECASE)
+                                if dp_match:
+                                    dp_raw = dp_match.group(1).upper()
                                     try:
-                                        dp_type = int(parts[1])
-                                        x_prefix = parts[2]
-                                        dist_hex = parts[3]
-                                        dp_batch_queue.put({
-                                            "x_prefix": x_prefix,
-                                            "dist_hex": dist_hex,
-                                            "dp_type": dp_type
-                                        })
+                                        if dp_raw.endswith('K'):
+                                            last_known_dps = int(float(dp_raw[:-1]) * 1000)
+                                        elif dp_raw.endswith('M'):
+                                            last_known_dps = int(float(dp_raw[:-1]) * 1000000)
+                                        elif dp_raw.endswith('G'):
+                                            last_known_dps = int(float(dp_raw[:-1]) * 1000000000)
+                                        else:
+                                            last_known_dps = int(float(dp_raw))
                                     except Exception:
                                         pass
-                            else:
-                                print(f"[RCK] {line_str}")
 
-                            # Parse Hashrate
-                            mhs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*MKeys', line_str, re.IGNORECASE)
-                            if mhs_match:
-                                last_known_mhs = float(mhs_match.group(1))
-                            else:
-                                ghs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*GKeys', line_str, re.IGNORECASE)
-                                if ghs_match:
-                                    last_known_mhs = float(ghs_match.group(1)) * 1000.0
-                                else:
-                                    khs_match = re.search(r'Speed:\s*(\d+(?:\.\d+)?)\s*KKeys', line_str, re.IGNORECASE)
-                                    if khs_match:
-                                        last_known_mhs = float(khs_match.group(1)) / 1000.0
-
-                            # Parse DPs count
-                            dp_match = re.search(r'DPs:\s*([\d\.]+[KMG]?)', line_str, re.IGNORECASE)
-                            if dp_match:
-                                dp_raw = dp_match.group(1).upper()
-                                try:
-                                    if dp_raw.endswith('K'):
-                                        last_known_dps = int(float(dp_raw[:-1]) * 1000)
-                                    elif dp_raw.endswith('M'):
-                                        last_known_dps = int(float(dp_raw[:-1]) * 1000000)
-                                    elif dp_raw.endswith('G'):
-                                        last_known_dps = int(float(dp_raw[:-1]) * 1000000000)
+                                # Parse potential solution line from stdout
+                                if "PRIVATE KEY:" in line_str:
+                                    candidate = line_str.split("PRIVATE KEY:")[-1].strip()
+                                    if verify_private_key(candidate, pubkey):
+                                        found_key = candidate
                                     else:
-                                        last_known_dps = int(float(dp_raw))
-                                except Exception:
-                                    pass
+                                        sys.stdout.write(f"⚠️ Falso positivo descartado pelo worker: {candidate}\n")
+                                        sys.stdout.flush()
 
-                            # Parse potential solution line from stdout
-                            if "PRIVATE KEY:" in line_str:
-                                candidate = line_str.split("PRIVATE KEY:")[-1].strip()
-                                # Mathematically verify against target pubkey
-                                if verify_private_key(candidate, pubkey):
-                                    found_key = candidate
-                                else:
-                                    print(f"⚠️ Falso positivo descartado pelo worker: {candidate}")
-
-                    # Heartbeat a cada 30s — reduz pressão no SQLite com chunks grandes
-                    if time.time() - last_heartbeat >= 30:
+                    # Heartbeat periódico a cada 2s para manter dashboard 100% em tempo real
+                    if time.time() - last_heartbeat >= 2:
                         http_post("/api/worker/heartbeat", {
                             "worker_id": WORKER_ID,
                             "hashrate_mhs": last_known_mhs,
@@ -551,7 +532,8 @@ def main():
                         })
                         break
 
-                    time.sleep(0.1)
+                    if items_processed == 0:
+                        time.sleep(0.01)
 
                 # Check RESULTS.TXT if generated during this run
                 if not found_key and os.path.exists(results_file) and os.path.getmtime(results_file) >= (chunk_start_time - 1):

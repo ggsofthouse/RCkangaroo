@@ -866,13 +866,16 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         cursor = conn.cursor()
         now = time.time()
         
-        # Workers active within the last 60 seconds
-        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < ? ORDER BY last_ping DESC", (now, WORKER_ALIVE_SECONDS))
+        # Workers: ATIVOS (últimos 60s) + RECENTEMENTE OFFLINE (últimos 5 min) para rastrear último estado
+        cursor.execute("SELECT * FROM workers WHERE (? - last_ping) < 300 ORDER BY last_ping DESC", (now,))
         raw_workers = [dict(w) for w in cursor.fetchall()]
         
         workers = []
         for w in raw_workers:
             w_dict = dict(w)
+            # Marca se está offline (não enviou heartbeat nos últimos 60s)
+            w_dict['is_offline'] = (now - w_dict.get('last_ping', 0)) >= WORKER_ALIVE_SECONDS
+            w_dict['secs_since_ping'] = int(now - w_dict.get('last_ping', 0))
             w_name = w_dict.get('name') or w_dict['worker_id']
             cursor.execute('''
                 SELECT c.start_hex, c.range_bits, j.start_percent, j.end_percent 
@@ -902,7 +905,8 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             w_dict['completed_chunks'] = cursor.fetchone()['cnt']
             workers.append(w_dict)
             
-        total_hashrate = sum(w['hashrate_mhs'] for w in workers)
+        # Apenas ONLINE contribui para o hashrate total
+        total_hashrate = sum(w['hashrate_mhs'] for w in workers if not w.get('is_offline', False))
         
         cursor.execute("SELECT * FROM jobs ORDER BY created_at DESC")
         jobs_raw = [dict(j) for j in cursor.fetchall()]
@@ -942,10 +946,13 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
 
         conn.close()
 
-        # Calcula soma real de chaves e total de DPs no banco global da nuvem
-        total_global_dps_cnt = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+        # Conta DPs apenas do Puzzle #140 (puzzle alvo principal) — exclui testes de puzzles menores
+        target_puzzle_for_dps = 140
+        total_global_dps_cnt = sum(
+            len(v) for k, v in GLOBAL_DP_CACHE.items() if k[0] == target_puzzle_for_dps
+        )
         try:
-            cursor.execute("SELECT COUNT(*) FROM global_dps")
+            cursor.execute("SELECT COUNT(*) FROM global_dps WHERE puzzle_number = ?", (target_puzzle_for_dps,))
             db_dp_cnt = cursor.fetchone()[0]
             if db_dp_cnt > total_global_dps_cnt:
                 total_global_dps_cnt = db_dp_cnt
@@ -954,15 +961,21 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
 
         keys_tested_live = 0
         active_job_uptime = "0h 0m"
-        if total_hashrate > 0 and jobs:
+        active_dp_bits = 18  # default para Puzzle #140
+        if jobs:
             act_j = next((j for j in jobs if j.get("status") == "ACTIVE"), jobs[0])
             c_time = act_j.get("created_at")
+            active_dp_bits = int(act_j.get("dp_bits", 18))
             if c_time:
                 elapsed_sec = max(0, time.time() - c_time)
-                keys_tested_live = int(total_hashrate * 1_000_000 * elapsed_sec)
                 h = int(elapsed_sec) // 3600
                 m = (int(elapsed_sec) % 3600) // 60
                 active_job_uptime = f"{h}h {m}m"
+                if total_hashrate > 0:
+                    keys_tested_live = int(total_hashrate * 1_000_000 * elapsed_sec)
+                else:
+                    # Fallback com base nos DPs coletados (DP 18 representa 2^18 = 262,144 chaves por DP)
+                    keys_tested_live = int(total_global_dps_cnt * (2 ** 18))
 
         if keys_tested_live >= 10**24:
             keys_zetta_str = f"{keys_tested_live / (10**24):.2f} Yottakeys"
@@ -996,8 +1009,9 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             w["gpu_count"] = g_cnt
             total_gpus += g_cnt
 
-        dp_bits_val = 20
-        dps_per_sec = int(total_hashrate * 1_000_000 / (2**dp_bits_val))
+        # DPs/s calculado com dp_bits REAL do job ativo (não hardcoded)
+        dp_bits_val = active_dp_bits if active_dp_bits and active_dp_bits >= 14 else 18
+        dps_per_sec = int(total_hashrate * 1_000_000 / (2**dp_bits_val)) if total_hashrate > 0 else 0
         if dps_per_sec >= 1_000_000:
             dps_per_sec_str = f"{dps_per_sec / 1_000_000:.2f}M DPs/s"
         elif dps_per_sec >= 1_000:
@@ -1016,6 +1030,13 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         else:
             total_dps_str = f"{total_global_dps_cnt} DPs"
 
+        # Armazenamento em Disco da VPS (em GB)
+        disk_total, disk_used, disk_free = shutil.disk_usage("/")
+        disk_total_gb = round(disk_total / (1024**3), 1)
+        disk_used_gb = round(disk_used / (1024**3), 1)
+        disk_free_gb = round(disk_free / (1024**3), 1)
+        disk_used_pct = round((disk_used / disk_total) * 100, 1)
+
         return {
             "active_workers_count": len(workers),
             "total_gpus_count": total_gpus,
@@ -1028,6 +1049,11 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             "k_subtext_str": f"K ≈ 1.15 (Armadilhas salvas na nuvem: {total_dps_str})",
             "active_kangaroos_m": f"{(total_gpus * 761856) / 1000000.0:.1f}M",
             "active_job_uptime": active_job_uptime,
+            "disk_used_gb": disk_used_gb,
+            "disk_total_gb": disk_total_gb,
+            "disk_free_gb": disk_free_gb,
+            "disk_used_pct": disk_used_pct,
+            "disk_str": f"{disk_used_gb} GB / {disk_total_gb} GB ({disk_used_pct}%)",
             "workers": workers,
             "jobs": jobs
         }
@@ -1046,6 +1072,10 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
             target_pubkey = req.pubkey.lower()
 
         if target_pubkey:
+            # SEMPRE cancela jobs de puzzles diferentes primeiro
+            cursor.execute("UPDATE jobs SET status = 'CANCELLED' WHERE status = 'ACTIVE' AND LOWER(pubkey) != ?", (target_pubkey,))
+            conn.commit()
+
             # Check if active job for exact same pubkey and matching range % already exists
             cursor.execute("""
                 SELECT job_id FROM jobs 
@@ -1080,9 +1110,6 @@ def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
                 conn.close()
                 return {"status": "EXISTS", "job_id": job_id}
 
-            # Deactivate jobs for a completely different puzzle
-            cursor.execute("UPDATE jobs SET status = 'CANCELLED' WHERE status = 'ACTIVE' AND LOWER(pubkey) != ?", (target_pubkey,))
-            conn.commit()
             conn.close()
     
     # Auto-create job for this specific range
@@ -1670,10 +1697,13 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         <img src="/logo.png" alt="RCKangaroo Logo" class="kangaroo-img-anim">
                     </div>
                     <div>
-                        <div class="d-flex align-items-center gap-2">
+                        <div class="d-flex align-items-center gap-2 flex-wrap">
                             <h1 class="h4 mb-0 fw-bold font-saiyan text-warning glow-gold">RCKANGAROO POOL COORDINATOR</h1>
                             <span class="badge badge-glow-green px-2.5 py-1 rounded-pill fs-7 font-semibold">
                                 <span class="pulse-dot me-1"></span> ONLINE (WAL)
+                            </span>
+                            <span class="badge badge-glow-cyan px-2.5 py-1 rounded-pill fs-7 font-semibold" id="vps-disk-badge" title="Armazenamento VPS em Uso">
+                                💾 DISCO VPS: <span id="vps-disk-text">Calculando...</span>
                             </span>
                         </div>
                         <span class="text-secondary fs-7">⚡ Coordenador Distribuído de Alta Performance — Range Completo (Sem Fatiamento Espacial)</span>
@@ -1920,12 +1950,32 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                     if (document.getElementById('keys-tested-subtext')) {
                         document.getElementById('keys-tested-subtext').innerText = 'Soma acumulada (' + (data.prob_pct_str || '0%') + ' exp. estatística)';
                     }
+                    if (document.getElementById('vps-disk-text')) {
+                        document.getElementById('vps-disk-text').innerText = (data.disk_used_gb || 0) + ' GB / ' + (data.disk_total_gb || 0) + ' GB (' + (data.disk_free_gb || 0) + ' GB livre)';
+                        const dBadge = document.getElementById('vps-disk-badge');
+                        if (dBadge) {
+                            const pct = data.disk_used_pct || 0;
+                            if (pct >= 90) {
+                                dBadge.className = "badge bg-danger text-white px-2.5 py-1 rounded-pill fs-7 font-semibold";
+                            } else if (pct >= 75) {
+                                dBadge.className = "badge bg-warning text-dark px-2.5 py-1 rounded-pill fs-7 font-semibold";
+                            } else {
+                                dBadge.className = "badge badge-glow-cyan px-2.5 py-1 rounded-pill fs-7 font-semibold";
+                            }
+                        }
+                    }
 
-                    // Solved Banner (Super Saiyan Dragon Ball Theme)
+                    // Solved Banner (Super Saiyan Dragon Ball Theme) + CATASTROPHE ALARM
                     const solvedContainer = document.getElementById('solved-solutions-container');
                     const solvedJobs = data.jobs.filter(j => j.status === 'SOLVED');
 
                     if (solvedJobs.length > 0) {
+                        // 🚨 CATASTROPHE ALARM — trigger once
+                        if (!window._alarmTriggered) {
+                            window._alarmTriggered = true;
+                            triggerCatastropheAlarm();
+                        }
+
                         solvedContainer.innerHTML = solvedJobs.map(sj => `
                             <div class="glass-card solved-banner p-4 mb-4">
                                 <div class="d-flex justify-content-between align-items-center mb-3">
@@ -1935,7 +1985,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                                     </div>
                                     <div>
                                         <span class="badge badge-glow-gold fs-6 me-2 font-mono">${sj.solved_at_str || 'Recente'}</span>
-                                        <button class="btn btn-outline-danger btn-sm font-semibold" onclick="deleteSingleJob('${sj.job_id}')">🗑️ Apagar Este Resultado</button>
+                                        <button class="btn btn-outline-danger btn-sm font-semibold" onclick="stopAlarm(); deleteSingleJob('${sj.job_id}')">🗑️ Apagar Este Resultado</button>
                                     </div>
                                 </div>
                                 <div class="row g-3">
@@ -1966,6 +2016,7 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         `).join('');
                     } else {
                         solvedContainer.innerHTML = '';
+                        window._alarmTriggered = false;
                     }
 
                     // Render Active Workers & Their Live Started Ranges
@@ -1974,29 +2025,37 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
                         workersBody.innerHTML = `<tr><td colspan="7" class="text-center text-secondary p-4">Nenhum guerreiro ativo no momento. Ao conectar um worker (local/Vast.ai), o poder dele aparecerá aqui automaticamente.</td></tr>`;
                     } else {
                         workersBody.innerHTML = data.workers.map(w => {
+                            const isOffline = w.is_offline === true;
                             const hrStr = w.hashrate_mhs >= 1000 ? (w.hashrate_mhs / 1000.0).toFixed(2) + ' GH/s' : w.hashrate_mhs.toFixed(2) + ' MH/s';
+                            const hrDisplay = isOffline
+                                ? `<span style="color:#888;font-family:'Orbitron',sans-serif;font-size:0.9rem;">${hrStr} <small class="text-secondary">(último)</small></span>`
+                                : `<span style="color: var(--accent-gold); font-weight: 800; font-family: 'Orbitron', sans-serif;" class="fs-6">${hrStr}</span>`;
                             const gCount = w.gpu_info ? Math.max(1, w.gpu_info.split(',').length) : 1;
                             const perGpuMhs = w.hashrate_mhs / gCount;
-                            const perGpuStr = gCount > 1 ? (perGpuMhs >= 1000 ? ` <br><span class="text-secondary font-mono fs-7">(${(perGpuMhs / 1000.0).toFixed(2)} GH/s/GPU)</span>` : ` <br><span class="text-secondary font-mono fs-7">(${perGpuMhs.toFixed(1)} MH/s/GPU)</span>`) : '';
+                            const perGpuStr = (!isOffline && gCount > 1) ? (perGpuMhs >= 1000 ? ` <br><span class="text-secondary font-mono fs-7">(${(perGpuMhs / 1000.0).toFixed(2)} GH/s/GPU)</span>` : ` <br><span class="text-secondary font-mono fs-7">(${perGpuMhs.toFixed(1)} MH/s/GPU)</span>`) : '';
                             const chunksBadge = w.completed_chunks > 0 ?
                                 `<span class="badge badge-glow-green px-3 py-1 fw-bold font-mono">${w.completed_chunks} chunks</span>` :
                                 `<span class="badge bg-dark text-secondary px-2 py-1 font-mono">${w.completed_chunks} chunks</span>`;
                             const rangeBadge = `<span class="badge badge-glow-cyan font-mono px-3 py-1.5 fw-semibold" style="font-size: 0.88rem;">${w.assigned_range || '0% → 100%'}</span>`;
                             const hexBadge = `<span class="badge bg-black border border-secondary text-info font-mono px-2 py-1">${w.current_start_hex || 'Iniciando...'}</span>`;
-                            const pingSecs = Math.max(0, Math.round(Date.now()/1000 - w.last_ping));
-                            
+                            const pingSecs = w.secs_since_ping || Math.max(0, Math.round(Date.now()/1000 - w.last_ping));
+                            const statusBadge = isOffline
+                                ? `<span class="badge bg-danger px-2 py-1 fs-7" style="animation:pulse-btn 0.8s ease-in-out infinite alternate;">🔴 OFFLINE (${pingSecs}s)</span>`
+                                : `<span class="badge badge-glow-green px-2 py-1 fs-7">🟢 Ativo (${pingSecs}s)</span>`;
+                            const rowStyle = isOffline ? 'style="opacity:0.6;background:rgba(255,0,0,0.03);"' : '';
+
                             return `
-                            <tr>
+                            <tr ${rowStyle}>
                                 <td>
-                                    <strong class="text-warning font-saiyan fs-6 glow-gold">${w.name}</strong><br>
+                                    <strong class="${isOffline ? 'text-secondary' : 'text-warning font-saiyan fs-6 glow-gold'}">${w.name}</strong><br>
                                     <code class="text-secondary fs-7 font-mono">${w.worker_id}</code>
                                 </td>
                                 <td><span class="text-light fs-7 fw-semibold">${w.gpu_info}</span></td>
-                                <td><span style="color: var(--accent-gold); font-weight: 800; font-family: 'Orbitron', sans-serif;" class="fs-6">${hrStr}</span>${perGpuStr}</td>
+                                <td>${hrDisplay}${perGpuStr}</td>
                                 <td>${rangeBadge}</td>
                                 <td>${hexBadge}</td>
                                 <td>${chunksBadge}</td>
-                                <td><span class="badge badge-glow-green px-2.5 py-1 fs-7">🟢 Ativo (${pingSecs}s atrás)</span></td>
+                                <td>${statusBadge}</td>
                             </tr>
                             `;
                         }).join('');
@@ -2121,8 +2180,101 @@ def get_dashboard(username: str = Depends(authenticate_dashboard)):
             }
 
             loadStats();
-            setInterval(loadStats, 3000);
+            setInterval(loadStats, 1000);
+
+            // ===== 🚨 CATASTROPHE ALARM SYSTEM =====
+            window._alarmCtx = null;
+            window._alarmInterval = null;
+            window._alarmFlash = null;
+
+            function triggerCatastropheAlarm() {
+                // --- Full-screen flashing red overlay ---
+                let overlay = document.getElementById('catastrophe-overlay');
+                if (!overlay) {
+                    overlay = document.createElement('div');
+                    overlay.id = 'catastrophe-overlay';
+                    overlay.style.cssText = `
+                        position: fixed; inset: 0; z-index: 99999; pointer-events: none;
+                        background: rgba(255,0,0,0.0);
+                        transition: background 0.15s;
+                    `;
+                    overlay.innerHTML = `
+                        <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+                            text-align:center;pointer-events:auto;">
+                            <div style="font-size:6rem;animation:spin 1s linear infinite;">🚨</div>
+                            <div style="font-size:2.5rem;font-weight:900;color:#fff;text-shadow:0 0 30px #f00,0 0 60px #f00;
+                                font-family:Orbitron,sans-serif;letter-spacing:4px;margin-top:1rem;">
+                                ⚡ CHAVE ENCONTRADA! ⚡
+                            </div>
+                            <button onclick="stopAlarm()" style="margin-top:2rem;padding:1rem 3rem;
+                                font-size:1.4rem;font-weight:900;background:#ff0000;color:#fff;
+                                border:3px solid #fff;border-radius:12px;cursor:pointer;
+                                font-family:Orbitron,sans-serif;box-shadow:0 0 40px #f00;
+                                animation:pulse-btn 0.5s ease-in-out infinite alternate;">
+                                🔕 PARAR ALARME
+                            </button>
+                        </div>
+                    `;
+                    document.body.appendChild(overlay);
+                }
+
+                let flashOn = false;
+                window._alarmFlash = setInterval(() => {
+                    flashOn = !flashOn;
+                    overlay.style.background = flashOn ? 'rgba(255,0,0,0.55)' : 'rgba(255,0,0,0.05)';
+                }, 200);
+
+                // --- Web Audio API Emergency Siren ---
+                try {
+                    window._alarmCtx = new (window.AudioContext || window.webkitAudioContext)();
+                    const ctx = window._alarmCtx;
+
+                    function playSirenCycle() {
+                        if (!window._alarmCtx || window._alarmCtx.state === 'closed') return;
+                        const osc = ctx.createOscillator();
+                        const gain = ctx.createGain();
+                        osc.connect(gain);
+                        gain.connect(ctx.destination);
+                        gain.gain.setValueAtTime(1.5, ctx.currentTime);
+                        // Sobe de 600Hz a 1200Hz em 0.6s, desce de volta em 0.6s
+                        osc.frequency.setValueAtTime(600, ctx.currentTime);
+                        osc.frequency.linearRampToValueAtTime(1200, ctx.currentTime + 0.6);
+                        osc.frequency.linearRampToValueAtTime(600, ctx.currentTime + 1.2);
+                        osc.type = 'sawtooth';
+                        osc.start(ctx.currentTime);
+                        osc.stop(ctx.currentTime + 1.2);
+                    }
+
+                    playSirenCycle();
+                    window._alarmInterval = setInterval(playSirenCycle, 1200);
+                } catch(e) {
+                    console.warn('Web Audio API não disponível:', e);
+                }
+            }
+
+            function stopAlarm() {
+                // Para a sirene
+                if (window._alarmInterval) {
+                    clearInterval(window._alarmInterval);
+                    window._alarmInterval = null;
+                }
+                if (window._alarmCtx) {
+                    try { window._alarmCtx.close(); } catch(e) {}
+                    window._alarmCtx = null;
+                }
+                // Para o flash
+                if (window._alarmFlash) {
+                    clearInterval(window._alarmFlash);
+                    window._alarmFlash = null;
+                }
+                const overlay = document.getElementById('catastrophe-overlay');
+                if (overlay) overlay.remove();
+            }
         </script>
+        <style>
+            @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+            @keyframes pulse-btn { from { box-shadow: 0 0 20px #f00; } to { box-shadow: 0 0 60px #f00, 0 0 100px #f00; } }
+        </style>
 
         <!-- Coverage Report Modal -->
         <div class="modal fade" id="coverageModal" tabindex="-1" aria-hidden="true">

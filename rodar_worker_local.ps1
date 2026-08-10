@@ -19,17 +19,15 @@ if ([string]::IsNullOrWhiteSpace($WorkerToken)) {
 $PuzzleNum = Read-Host "👉 Digite o numero do Puzzle (ex: 140) [padrao: 140]"
 if ([string]::IsNullOrWhiteSpace($PuzzleNum)) { $PuzzleNum = "140" }
 
-$StartPct = Read-Host "👉 Porcentagem INICIAL do range (0 a 100) [padrao: 85.0]"
-if ([string]::IsNullOrWhiteSpace($StartPct)) { $StartPct = "85.0" }
-
-$EndPct = Read-Host "👉 Porcentagem FINAL do range (0 a 100) [padrao: 100.0]"
-if ([string]::IsNullOrWhiteSpace($EndPct)) { $EndPct = "100.0" }
+# Por padrão faz a busca no RANGE COMPLETO (0% a 100%)
+$StartPct = "0.0"
+$EndPct = "100.0"
 
 Write-Host ""
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host "🚀 Iniciando Worker Local..." -ForegroundColor Green
 Write-Host "Puzzle:  #$PuzzleNum" -ForegroundColor White
-Write-Host "Range:   $StartPct% ate $EndPct%" -ForegroundColor White
+Write-Host "Range:   Completo ($StartPct% ate $EndPct%)" -ForegroundColor White
 Write-Host "==================================================" -ForegroundColor Cyan
 Write-Host ""
 
