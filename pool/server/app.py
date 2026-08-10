@@ -353,31 +353,10 @@ def init_db():
         conn.commit()
         conn.close()
 
-GLOBAL_DP_CACHE: Dict[tuple, List[dict]] = {}
-
-def load_global_dp_cache():
-    global GLOBAL_DP_CACHE
-    with db_lock:
-        conn = get_db()
-        cursor = conn.cursor()
-        cursor.execute("SELECT puzzle_number, x_prefix, dist_hex, dp_type, worker_name FROM global_dps")
-        rows = cursor.fetchall()
-        cache = {}
-        for r in rows:
-            key = (int(r["puzzle_number"]), str(r["x_prefix"]).lower())
-            if key not in cache:
-                cache[key] = []
-            cache[key].append({
-                "dist_hex": str(r["dist_hex"]).lower(),
-                "type": int(r["dp_type"]),
-                "worker": str(r["worker_name"])
-            })
-        GLOBAL_DP_CACHE = cache
-        print(f"🧠 Cache de DPs Globais carregado na memória: {len(rows)} DPs totais.")
-        conn.close()
+# GLOBAL_DP_CACHE removido - toda consulta/colisão de DPs é feita diretamente no SQLite
+# O índice idx_global_dps_x em (puzzle_number, x_prefix) garante performance O(log n)
 
 init_db()
-load_global_dp_cache()
 
 # ─── Background: recoloca chunks abandonados de volta para PENDING ────────────
 # Timeout configurável por env var: chunks grandes (90-bits) podem durar horas
@@ -594,8 +573,17 @@ def create_job(req: CreateJobRequest, username: str = Depends(authenticate_dashb
 @app.post("/api/dp/submit_batch")
 def submit_dp_batch(data: DPBatchSubmit, request: Request):
     verify_worker_token(request)
+
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        total_db_dps = cursor.execute(
+            "SELECT COUNT(*) FROM global_dps WHERE puzzle_number = ?", (data.puzzle_number,)
+        ).fetchone()[0]
+        conn.close()
+
     if not data.dps:
-        return {"status": "ok", "ingested": 0, "total_global_dps": sum(len(v) for v in list(GLOBAL_DP_CACHE.values())), "solved": False}
+        return {"status": "ok", "ingested": 0, "total_global_dps": total_db_dps, "solved": False}
 
     solved = False
     solved_key = None
@@ -618,70 +606,66 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
             x_clean = dp.x_prefix.strip().lower()
             d_clean = dp.dist_hex.strip().lower()
             dp_type = int(dp.dp_type)
-            cache_key = (data.puzzle_number, x_clean)
 
-            if cache_key in GLOBAL_DP_CACHE:
-                for existing in GLOBAL_DP_CACHE[cache_key]:
-                    if existing["type"] != dp_type or existing["dist_hex"] != d_clean:
+            # Busca colisão diretamente no SQLite (índice idx_global_dps_x garante velocidade)
+            existing_rows = cursor.execute(
+                "SELECT dist_hex, dp_type FROM global_dps WHERE puzzle_number = ? AND x_prefix = ? AND dp_type != ?",
+                (data.puzzle_number, x_clean, dp_type)
+            ).fetchall()
+
+            for existing in existing_rows:
+                try:
+                    dist1 = int(str(existing["dist_hex"]).lower(), 16)
+                    dist2 = int(d_clean, 16)
+                    diff_direct = abs(dist1 - dist2)
+                    diff_half = diff_direct // 2
+
+                    start_offset = 0
+                    if start_hex_val:
                         try:
-                            dist1 = int(existing["dist_hex"], 16)
-                            dist2 = int(d_clean, 16)
-                            diff_direct = abs(dist1 - dist2)
-                            diff_half = diff_direct // 2
-
+                            start_offset = int(str(start_hex_val).replace("0x", ""), 16)
+                        except Exception:
                             start_offset = 0
-                            if start_hex_val:
-                                try:
-                                    start_offset = int(str(start_hex_val).replace("0x", ""), 16)
-                                except Exception:
-                                    start_offset = 0
 
-                            cand_ints = set()
-                            for diff in [diff_direct, diff_half]:
-                                if diff == 0:
-                                    continue
-                                cand_ints.add(diff)
-                                if start_offset > 0:
-                                    cand_ints.add(diff + start_offset)
-                                    if diff > start_offset:
-                                        cand_ints.add(diff - start_offset)
-                                    else:
-                                        cand_ints.add(start_offset - diff)
+                    cand_ints = set()
+                    for diff in [diff_direct, diff_half]:
+                        if diff == 0:
+                            continue
+                        cand_ints.add(diff)
+                        if start_offset > 0:
+                            cand_ints.add(diff + start_offset)
+                            if diff > start_offset:
+                                cand_ints.add(diff - start_offset)
+                            else:
+                                cand_ints.add(start_offset - diff)
 
-                            if target_pubkey:
-                                for c_val in cand_ints:
-                                    cand = f"{c_val:064x}"
-                                    if verify_private_key(cand, target_pubkey):
-                                        solved = True
-                                        solved_key = cand
-                                        log_event(f"🎉 COLISÃO GLOBAL DE DP DETECTADA! Worker: {data.worker_name} | Chave: 0x{cand}")
-                                        if job_id:
-                                            cursor.execute(
-                                                "UPDATE jobs SET status='SOLVED', solved_at=?, solved_by=?, private_key=? WHERE job_id=?",
-                                                (now, data.worker_name, cand, job_id)
-                                            )
-                                            results_path = os.path.join(BASE_DIR, "POOL_RESULTS.TXT")
-                                            wif = hex_to_wif(cand)
-                                            addr = pubkey_to_address(target_pubkey)
-                                            with open(results_path, "a", encoding="utf-8") as f:
-                                                f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] PUZZLE #{data.puzzle_number} RESOLVIDO VIA DP GLOBAL!\n")
-                                                f.write(f"  Worker: {data.worker_name}\n")
-                                                f.write(f"  Pubkey: {target_pubkey}\n")
-                                                f.write(f"  PrivKey Hex: 0x{cand}\n")
-                                                f.write(f"  WIF: {wif}\n")
-                                                f.write(f"  Endereco BTC: {addr}\n")
-                                        break
-                        except Exception as ex:
-                            print(f"⚠️ Erro ao calcular candidato de colisão DP: {ex}")
+                    if target_pubkey:
+                        for c_val in cand_ints:
+                            cand = f"{c_val:064x}"
+                            if verify_private_key(cand, target_pubkey):
+                                solved = True
+                                solved_key = cand
+                                log_event(f"🎉 COLISÃO GLOBAL DE DP DETECTADA! Worker: {data.worker_name} | Chave: 0x{cand}")
+                                if job_id:
+                                    cursor.execute(
+                                        "UPDATE jobs SET status='SOLVED', solved_at=?, solved_by=?, private_key=? WHERE job_id=?",
+                                        (now, data.worker_name, cand, job_id)
+                                    )
+                                    results_path = os.path.join(BASE_DIR, "POOL_RESULTS.TXT")
+                                    wif = hex_to_wif(cand)
+                                    addr = pubkey_to_address(target_pubkey)
+                                    with open(results_path, "a", encoding="utf-8") as f:
+                                        f.write(f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] PUZZLE #{data.puzzle_number} RESOLVIDO VIA DP GLOBAL!\n")
+                                        f.write(f"  Worker: {data.worker_name}\n")
+                                        f.write(f"  Pubkey: {target_pubkey}\n")
+                                        f.write(f"  PrivKey Hex: 0x{cand}\n")
+                                        f.write(f"  WIF: {wif}\n")
+                                        f.write(f"  Endereco BTC: {addr}\n")
+                                break
+                except Exception as ex:
+                    print(f"⚠️ Erro ao calcular candidato de colisão DP: {ex}")
 
             db_records.append((data.puzzle_number, x_clean, d_clean, dp_type, data.worker_name, now))
-            if cache_key not in GLOBAL_DP_CACHE:
-                GLOBAL_DP_CACHE[cache_key] = []
-            GLOBAL_DP_CACHE[cache_key].append({
-                "dist_hex": d_clean,
-                "type": dp_type,
-                "worker": data.worker_name
-            })
             ingested_count += 1
 
         if db_records:
@@ -695,31 +679,34 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
             )
             conn.commit()
 
+        total_db_dps = cursor.execute(
+            "SELECT COUNT(*) FROM global_dps WHERE puzzle_number = ?", (data.puzzle_number,)
+        ).fetchone()[0]
         conn.close()
 
-    total_cached = sum(len(v) for v in list(GLOBAL_DP_CACHE.values()))
     return {
         "status": "ok",
         "ingested": ingested_count,
-        "total_global_dps": total_cached,
+        "total_global_dps": total_db_dps,
         "solved": solved,
         "private_key": solved_key
     }
 
+
 @app.get("/api/dp/stats")
 def get_dp_stats():
-    total_cached = sum(len(v) for v in list(GLOBAL_DP_CACHE.values()))
-    tames = 0
-    wilds = 0
-    worker_counts = {}
-    for (puzz, x), items in GLOBAL_DP_CACHE.items():
-        for item in items:
-            if item["type"] == 0:
-                tames += 1
-            else:
-                wilds += 1
-            w = item["worker"]
-            worker_counts[w] = worker_counts.get(w, 0) + 1
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        total_cached = cursor.execute("SELECT COUNT(*) FROM global_dps").fetchone()[0]
+        tames = cursor.execute("SELECT COUNT(*) FROM global_dps WHERE dp_type = 0").fetchone()[0]
+        wilds = total_cached - tames
+        worker_counts_rows = cursor.execute(
+            "SELECT worker_name, COUNT(*) as cnt FROM global_dps GROUP BY worker_name"
+        ).fetchall()
+        conn.close()
+
+    worker_counts = {r["worker_name"]: r["cnt"] for r in worker_counts_rows}
 
     return {
         "total_dps": total_cached,
@@ -946,18 +933,14 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
 
         conn.close()
 
-        # Conta DPs apenas do Puzzle #140 (puzzle alvo principal) — exclui testes de puzzles menores
+        # Conta DPs diretamente do SQLite - zero RAM, 100% confiável
         target_puzzle_for_dps = 140
-        total_global_dps_cnt = sum(
-            len(v) for k, v in GLOBAL_DP_CACHE.items() if k[0] == target_puzzle_for_dps
-        )
-        try:
-            cursor.execute("SELECT COUNT(*) FROM global_dps WHERE puzzle_number = ?", (target_puzzle_for_dps,))
-            db_dp_cnt = cursor.fetchone()[0]
-            if db_dp_cnt > total_global_dps_cnt:
-                total_global_dps_cnt = db_dp_cnt
-        except Exception:
-            pass
+        with db_lock:
+            conn2 = get_db()
+            total_global_dps_cnt = conn2.execute(
+                "SELECT COUNT(*) FROM global_dps WHERE puzzle_number = ?", (target_puzzle_for_dps,)
+            ).fetchone()[0]
+            conn2.close()
 
         keys_tested_live = 0
         active_job_uptime = "0h 0m"
