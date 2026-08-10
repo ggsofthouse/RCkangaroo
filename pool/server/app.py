@@ -595,7 +595,7 @@ def create_job(req: CreateJobRequest, username: str = Depends(authenticate_dashb
 def submit_dp_batch(data: DPBatchSubmit, request: Request):
     verify_worker_token(request)
     if not data.dps:
-        return {"status": "ok", "ingested": 0, "total_global_dps": sum(len(v) for v in GLOBAL_DP_CACHE.values()), "solved": False}
+        return {"status": "ok", "ingested": 0, "total_global_dps": sum(len(v) for v in list(GLOBAL_DP_CACHE.values())), "solved": False}
 
     solved = False
     solved_key = None
@@ -697,7 +697,7 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
 
         conn.close()
 
-    total_cached = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+    total_cached = sum(len(v) for v in list(GLOBAL_DP_CACHE.values()))
     return {
         "status": "ok",
         "ingested": ingested_count,
@@ -708,7 +708,7 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
 
 @app.get("/api/dp/stats")
 def get_dp_stats():
-    total_cached = sum(len(v) for v in GLOBAL_DP_CACHE.values())
+    total_cached = sum(len(v) for v in list(GLOBAL_DP_CACHE.values()))
     tames = 0
     wilds = 0
     worker_counts = {}
