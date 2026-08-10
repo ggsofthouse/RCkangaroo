@@ -1266,7 +1266,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         if pending:
             chunk = dict(pending)
             chunk_bits = chunk['range_bits']
-            dp_bits_dynamic = 20 if chunk_bits >= 90 else (16 if chunk_bits >= 70 else min(19, max(14, (chunk_bits // 2) - 26)))
+            dp_bits_dynamic = 24 if chunk_bits >= 90 else (20 if chunk_bits >= 70 else min(20, max(16, (chunk_bits // 2) - 26)))
             cursor.execute("""
                 UPDATE chunks 
                 SET status = 'ASSIGNED',
@@ -1341,15 +1341,15 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             req.worker_id, now, now
         ))
 
-        # dp_bits cravado em 18/19 para Puzzle 140 (bits=139) -> Garante K ≈ 1.15 (Overhead < 1%)
+        # DP bits aumentados para 24/22 para evitar buffer overflow nas RTX 4090/5090
         if job['range_bits'] >= 100:
-            dp_bits_dynamic = 18
+            dp_bits_dynamic = 24
         elif session_budget_bits >= 90:
-            dp_bits_dynamic = 20
+            dp_bits_dynamic = 24
         elif session_budget_bits >= 70:
-            dp_bits_dynamic = 18
+            dp_bits_dynamic = 22
         else:
-            dp_bits_dynamic = min(19, max(14, (session_budget_bits // 2) - 26))
+            dp_bits_dynamic = min(22, max(16, (session_budget_bits // 2) - 26))
 
         conn.commit()
         conn.close()
@@ -1373,7 +1373,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
         # Medições reais:  dp=32→K=12.52 | dp=26→K=2.52 | dp=21→K=1.165 | dp=20→K=1.15
         # dp=19 (DP 19) → overhead ≈ 2–3% → K ≈ 1.15 ✓  RAM ≈ 3.6 GB/GPU
         # dp_ideal ≈ (chunk_bits // 2) - 26  →  90-bit: 19, 80-bit: 14, 66-bit: 14(min)
-        dp_bits_dynamic = min(19, max(14, (chunk_bits // 2) - 26))
+        dp_bits_dynamic = min(24, max(16, (chunk_bits // 2) - 26))
 
         # max_ops = (chunk_bits / range_bits) * 1.5  — margem segura com K≈1.15
         max_ops_dynamic = round((chunk_bits / job['range_bits']) * 1.5, 2)
