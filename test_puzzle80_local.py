@@ -46,7 +46,7 @@ def main():
 
     print(f"⚙️ Executando busca na GPU:\n   {' '.join(cmd)}\n")
     t0 = time.time()
-    subprocess.run(cmd, cwd=os.path.dirname(bin_path))
+    subprocess.run(cmd, cwd=root_dir)
     print(f"\n✅ Teste concluído em {time.time()-t0:.1f} segundos.")
 
 if __name__ == "__main__":

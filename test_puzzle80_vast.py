@@ -120,8 +120,6 @@ def main():
     bin_path = find_or_build_binary()
     print(f"🔧 Binário: {bin_path}\n")
 
-    bin_dir = os.path.dirname(bin_path)
-
     # Roda em todas as GPUs em paralelo (uma instância por GPU)
     procs = []
     t0 = time.time()
@@ -137,7 +135,7 @@ def main():
             "-max",   str(MAX_OPS)
         ]
         print(f"🚀 GPU [{idx}] {name}: {' '.join(cmd)}")
-        p = subprocess.Popen(cmd, cwd=bin_dir)
+        p = subprocess.Popen(cmd, cwd=ROOT_DIR)
         procs.append((idx, name, p))
 
     print(f"\n⏳ {len(procs)} instância(s) rodando... Aguardando conclusão.\n")
