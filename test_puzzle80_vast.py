@@ -56,8 +56,10 @@ def detect_gpus():
 def find_or_build_binary():
     """Procura o binário compilado; se não existir, compila automaticamente."""
     candidates = [
+        os.path.join(ROOT_DIR, "build", "bin", "rckangaroo"),
         os.path.join(ROOT_DIR, "build", "rckangaroo"),
         os.path.join(ROOT_DIR, "build", "RCKangaroo"),
+        os.path.join(ROOT_DIR, "bin", "rckangaroo"),
         os.path.join(ROOT_DIR, "rckangaroo"),
         os.path.join(ROOT_DIR, "RCKangaroo"),
     ]
