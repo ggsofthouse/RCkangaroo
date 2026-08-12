@@ -56,6 +56,12 @@ double gMax;
 bool gGenMode; //tames generation mode
 bool gIsOpsLimit;
 bool gStreamDPs = false;
+int gSmInvOverride = -1; // -1: automatic; otherwise reserve this many SMs for inversion
+u64 gJumpSeed = 0;
+int gJumpShift = 3; // primary jump minimum is 2^(Range/2 + gJumpShift)
+int gBenchCount = 0; // 0: run benchmark indefinitely
+u64 gBenchSeconds = 0; // 0: no fixed wall-clock limit
+bool gTuneStats = false;
 
 #pragma pack(push, 1)
 struct DBRec
@@ -128,7 +134,18 @@ void InitGpus()
 			GpuKangs[GpuCnt]->sm_inv_cnt = GpuKangs[GpuCnt]->Is5xxx ? (GpuKangs[GpuCnt]->mpCnt / 24) : (GpuKangs[GpuCnt]->mpCnt / 32);
 			if (!GpuKangs[GpuCnt]->sm_inv_cnt)
 				GpuKangs[GpuCnt]->sm_inv_cnt = 1;
-			printf("GPU %d: turbo kernel is enabled!\r\n", i);
+			if (gSmInvOverride > 0)
+			{
+				if (gSmInvOverride >= GpuKangs[GpuCnt]->mpCnt)
+				{
+					printf("GPU %d: -inv-sm must be smaller than the GPU SM count\r\n", i);
+					delete GpuKangs[GpuCnt];
+					continue;
+				}
+				GpuKangs[GpuCnt]->sm_inv_cnt = gSmInvOverride;
+			}
+			printf("GPU %d: turbo kernel is enabled, inversion SMs: %d%s\r\n", i,
+				GpuKangs[GpuCnt]->sm_inv_cnt, gSmInvOverride > 0 ? " (override)" : " (auto)");
 		}
 		GpuCnt++;
 	}
@@ -331,6 +348,19 @@ void ShowStats(u64 tm_start, double exp_ops, double dp_val)
 	int min = (int)(sec - days * (3600 * 24) - hours * 3600) / 60;
 	 
 	printf("%sSpeed: %d MKeys/s, Err: %d, DPs: %lluK/%lluK, Time: %llud:%02dh:%02dm/%llud:%02dh:%02dm\r\n", gGenMode ? "GEN: " : (IsBench ? "BENCH: " : "MAIN: "), speed, gTotalErrors, db.GetBlockCnt()/1000, est_dps_cnt/1000, days, hours, min, exp_days, exp_hours, exp_min);
+	if (gTuneStats)
+	{
+		for (int i = 0; i < GpuCnt; i++)
+		{
+			u64 batches, loops, dps, elapsed_ms;
+			GpuKangs[i]->GetTuneStats(&batches, &loops, &dps, &elapsed_ms);
+			double dp_per_sec = elapsed_ms ? (1000.0 * (double)dps / (double)elapsed_ms) : 0.0;
+			printf("TUNE GPU %d: speed %d MKeys/s, batches %llu, loops %llu, DP/s %.1f, inv-sm %d\r\n",
+				GpuKangs[i]->CudaIndex, GpuKangs[i]->GetStatsSpeed(),
+				(unsigned long long)batches, (unsigned long long)loops,
+				dp_per_sec, GpuKangs[i]->sm_inv_cnt);
+		}
+	}
 	fflush(stdout);
 }
 
@@ -401,13 +431,15 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		fflush(stdout);
 	}
 
-	SetRndSeed(0); //use same seed to make tames from file compatible
+	SetRndSeed(gJumpSeed); //seed 0 preserves compatibility with existing default tames
 	PntTotalOps = 0;
 	PntIndex = 0;
 //prepare jumps
 	EcInt minjump, t;
 	minjump.Set(1);
-	minjump.ShiftLeft(Range / 2 + 3);
+	minjump.ShiftLeft(Range / 2 + gJumpShift);
+	printf("Jump experiment: seed %llu, primary shift %+d, 512 uniform entries\r\n",
+		(unsigned long long)gJumpSeed, gJumpShift);
 	for (int i = 0; i < JMP_CNT; i++)
 	{
 		EcJumps1[i].dist = minjump;
@@ -494,6 +526,12 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 			printf("Operations limit reached\r\n");
 			break;
 		}
+		if ((gBenchSeconds > 0) && ((GetTickCount64() - tm0) >= gBenchSeconds * 1000))
+		{
+			gIsOpsLimit = true;
+			printf("Benchmark time limit reached\r\n");
+			break;
+		}
 	}
 
 	printf("Stopping work ...\r\n");
@@ -501,6 +539,13 @@ bool SolvePoint(EcPoint PntToSolve, int Range, int DP, EcInt* pk_res)
 		GpuKangs[i]->Stop();
 	while (ThrCnt)
 		Sleep(10);
+	if (gBenchSeconds > 0)
+	{
+		double elapsed = (GetTickCount64() - tm0) / 1000.0;
+		double avg_mkeys = elapsed > 0.0 ? ((double)PntTotalOps / elapsed / 1e6) : 0.0;
+		printf("TUNE RESULT: elapsed %.3f s, ops %llu, average %.3f MKeys/s\r\n",
+			elapsed, (unsigned long long)PntTotalOps, avg_mkeys);
+	}
 	for (int i = 0; i < GpuCnt; i++)
 	{
 #ifdef _WIN32
@@ -558,6 +603,90 @@ bool ParseCommandLine(int argc, char* argv[])
 				}
 				gGPUs_Mask[gpus[i] - '0'] = 1;
 			}
+		}
+		else
+		if (strcmp(argument, "-bench-seconds") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missed value after -bench-seconds option\r\n");
+				return false;
+			}
+			unsigned long long val = strtoull(argv[ci], NULL, 10);
+			ci++;
+			if ((val < 1) || (val > 86400))
+			{
+				printf("error: invalid value for -bench-seconds option (expected 1...86400)\r\n");
+				return false;
+			}
+			gBenchSeconds = (u64)val;
+		}
+		else
+		if (strcmp(argument, "-tune-stats") == 0)
+		{
+			gTuneStats = true;
+		}
+		else
+		if (strcmp(argument, "-jump-seed") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missed value after -jump-seed option\r\n");
+				return false;
+			}
+			gJumpSeed = (u64)strtoull(argv[ci], NULL, 0);
+			ci++;
+		}
+		else
+		if (strcmp(argument, "-jump-shift") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missed value after -jump-shift option\r\n");
+				return false;
+			}
+			int val = atoi(argv[ci]);
+			ci++;
+			if ((val < -4) || (val > 8))
+			{
+				printf("error: invalid value for -jump-shift option (expected -4...8)\r\n");
+				return false;
+			}
+			gJumpShift = val;
+		}
+		else
+		if (strcmp(argument, "-bench-count") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missed value after -bench-count option\r\n");
+				return false;
+			}
+			int val = atoi(argv[ci]);
+			ci++;
+			if ((val < 1) || (val > 1000000))
+			{
+				printf("error: invalid value for -bench-count option\r\n");
+				return false;
+			}
+			gBenchCount = val;
+		}
+		else
+		if (strcmp(argument, "-inv-sm") == 0)
+		{
+			if (ci >= argc)
+			{
+				printf("error: missed value after -inv-sm option\r\n");
+				return false;
+			}
+			int val = atoi(argv[ci]);
+			ci++;
+			if ((val < 1) || (val > 64))
+			{
+				printf("error: invalid value for -inv-sm option (expected 1...64)\r\n");
+				return false;
+			}
+			gSmInvOverride = val;
 		}
 		else
 		if (strcmp(argument, "-dp") == 0)
@@ -647,6 +776,11 @@ bool ParseCommandLine(int argc, char* argv[])
 			return false;
 		}
 		gGenMode = true;
+	}
+	if (gTamesFileName[0] && ((gJumpSeed != 0) || (gJumpShift != 3)))
+	{
+		printf("error: custom jump parameters cannot be combined with -tames\r\n");
+		return false;
 	}
 	return true;
 }
@@ -801,7 +935,8 @@ int main(int argc, char* argv[])
 			u64 ops_per_pnt = TotalOps / TotalSolved;
 			double K = (double)ops_per_pnt / pow(2.0, gRange / 2.0);
 			printf("Points solved: %d, average K: %.3f (with DP and GPU overheads)\r\n", TotalSolved, K);
-			//if (TotalSolved >= 100) break; //dbg
+			if ((gBenchCount > 0) && (TotalSolved >= (u32)gBenchCount))
+				break;
 		}
 	}
 label_end:

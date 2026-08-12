@@ -55,6 +55,10 @@ private:
 	int SpeedStats[STATS_WND_SIZE];
 
 	int Inv_DataSize;
+	u64 StatsBatches;
+	u64 StatsLoops;
+	u64 StatsDPs;
+	u64 StatsElapsedMs;
 
 	void GenerateRndDistances();
 	bool Start();
@@ -85,4 +89,5 @@ public:
 	u32 dbg[256];
 
 	int GetStatsSpeed();
+	void GetTuneStats(u64* batches, u64* loops, u64* dps, u64* elapsed_ms);
 };

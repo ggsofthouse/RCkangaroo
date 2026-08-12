@@ -31,6 +31,18 @@ Discussion thread: https://bitcointalk.org/index.php?topic=5517607
 
 <b>-gpu</b>		which GPUs are used, for example, "035" means that GPUs #0, #3 and #5 are used. If not specified, all available GPUs are used. 
 
+<b>-inv-sm</b>		override the number of SMs reserved by the turbo kernel for inversion (1...64). If omitted, the built-in automatic value is used. This is intended for reproducible tuning; benchmark neighboring values and keep the fastest stable result.
+
+<b>-jump-seed</b>		select a deterministic seed for experimental jump tables. The default is 0. Custom jump parameters cannot be combined with <b>-tames</b>.
+
+<b>-jump-shift</b>		set the primary jump scale exponent offset (-4...8). The default is 3, meaning a minimum jump of 2^(range/2+3). Experimental option: compare average K over many solved benchmark points, not a single solve.
+
+<b>-bench-count</b>		stop benchmark mode after this many correctly solved random points. This makes parameter sweeps reproducible and scriptable.
+
+<b>-bench-seconds</b>		stop after a fixed wall-clock duration (1...86400 seconds). Intended for fair GPU tuning runs independent of collision luck.
+
+<b>-tune-stats</b>		print per-GPU speed, loop count, DP rate, batch count and inversion-SM setting while tuning.
+
 <b>-pubkey</b>		public key to solve, both compressed and uncompressed keys are supported. If not specified, software starts in benchmark mode and solves random keys. 
 
 <b>-start</b>		start offset of the key, in hex. Mandatory if "-pubkey" option is specified. For example, for puzzle #85 start offset is "1000000000000000000000". 

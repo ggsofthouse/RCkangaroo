@@ -42,6 +42,10 @@ bool RCGpuKang::Prepare(EcPoint _PntToSolve, int _Range, int _DP, EcJMP* _EcJump
 	memset(dbg, 0, sizeof(dbg));
 	memset(SpeedStats, 0, sizeof(SpeedStats));
 	cur_stats_ind = 0;
+	StatsBatches = 0;
+	StatsLoops = 0;
+	StatsDPs = 0;
+	StatsElapsedMs = 0;
 
 	cudaError_t err;
 	err = cudaSetDevice(CudaIndex);
@@ -699,6 +703,10 @@ void RCGpuKang::Execute()
 
 		SpeedStats[cur_stats_ind] = cur_speed;
 		cur_stats_ind = (cur_stats_ind + 1) % STATS_WND_SIZE;
+		StatsBatches++;
+		StatsLoops += lcnt;
+		StatsDPs += cnt;
+		StatsElapsedMs += tm;
 
 #ifdef DEBUG_MODE
 		if ((iter % 300) == 0)
@@ -734,6 +742,14 @@ int RCGpuKang::GetStatsSpeed()
 	for (int i = 1; i < STATS_WND_SIZE; i++)
 		res += SpeedStats[i];
 	return res / STATS_WND_SIZE;
+}
+
+void RCGpuKang::GetTuneStats(u64* batches, u64* loops, u64* dps, u64* elapsed_ms)
+{
+	*batches = StatsBatches;
+	*loops = StatsLoops;
+	*dps = StatsDPs;
+	*elapsed_ms = StatsElapsedMs;
 }
 
 void RCGpuKang::Asm_CallGpuKernelAB()

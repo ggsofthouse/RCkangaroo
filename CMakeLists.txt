@@ -54,10 +54,11 @@ target_include_directories(${TARGET_NAME} PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
-# Remove compute_61 which is unsupported in newer CUDA, and add compute_90 for RTX 5090
+# Native CUDA code for Blackwell (RTX 50xx) plus Ada and older fallback targets.
 target_compile_options(${TARGET_NAME} PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:-O3>
-    $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_90,code=compute_90>
+	$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=sm_120>
+	$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_120,code=compute_120>
     $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_89,code=compute_89>
     $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_86,code=compute_86>
     $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_75,code=compute_75>
