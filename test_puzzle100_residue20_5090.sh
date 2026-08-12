@@ -18,7 +18,7 @@ if [[ ! -x "$binary" ]]; then
 fi
 
 echo "== Puzzle #100 reduced by 20 known low bits =="
-echo "Expected reduced key q: AF55FC59C335C8EC67E"
+echo "Expected reduced key q: AF55FC59C335C8EC67ED"
 echo "Expected original key: 000000000000000000000000000000000000000AF55FC59C335C8EC67ED24826"
 
 start_epoch="$(date +%s)"
@@ -32,7 +32,7 @@ start_epoch="$(date +%s)"
 elapsed="$(( $(date +%s) - start_epoch ))"
 
 found="$(sed -n 's/.*PRIVATE KEY:[[:space:]]*\([0-9A-Fa-f]*\).*/\1/p' p100_20bit_5090.log | tail -n 1)"
-expected_q="AF55FC59C335C8EC67E"
+expected_q="AF55FC59C335C8EC67ED"
 
 echo "== Verification =="
 echo "Elapsed: ${elapsed}s"
