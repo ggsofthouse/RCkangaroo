@@ -33,6 +33,8 @@ Discussion thread: https://bitcointalk.org/index.php?topic=5517607
 
 <b>-inv-sm</b>		override the number of SMs reserved by the turbo kernel for inversion (1...64). If omitted, the built-in automatic value is used. This is intended for reproducible tuning; benchmark neighboring values and keep the fastest stable result.
 
+Measured example: on one 170-SM RTX 5090 (CUDA 13.1), range 139 / DP 20, a 30-second fixed-time comparison measured 19.221 GKeys/s with automatic 7 inversion SMs and 19.794 GKeys/s with <b>-inv-sm 10</b> (+2.98%). Treat this as a per-host tuning result, not a universal default.
+
 <b>-jump-seed</b>		select a deterministic seed for experimental jump tables. The default is 0. Custom jump parameters cannot be combined with <b>-tames</b>.
 
 <b>-jump-shift</b>		set the primary jump scale exponent offset (-4...8). The default is 3, meaning a minimum jump of 2^(range/2+3). Experimental option: compare average K over many solved benchmark points, not a single solve.
