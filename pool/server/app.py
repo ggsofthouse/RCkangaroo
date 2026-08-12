@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI(title="RCKangaroo Distributed Pool Coordinator", version="6.1")
 
@@ -241,7 +241,11 @@ def init_db():
             os.makedirs(backup_dir, exist_ok=True)
             if os.path.exists(DB_FILE) and os.path.getsize(DB_FILE) > 0:
                 backup_path = os.path.join(backup_dir, f"pool_auto_{int(time.time())}.db")
-                shutil.copy2(DB_FILE, backup_path)
+                source_db = sqlite3.connect(DB_FILE, timeout=60.0)
+                backup_db = sqlite3.connect(backup_path)
+                source_db.backup(backup_db)
+                backup_db.close()
+                source_db.close()
                 print(f"📦 Backup automático do banco criado em: {backup_path}")
         except Exception as e:
             print(f"⚠️ Erro ao criar backup automático: {e}")
@@ -345,6 +349,34 @@ def init_db():
         ''')
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_global_dps_x ON global_dps(puzzle_number, x_prefix)")
 
+        # DP-first sessions replace the old keyspace chunk scheduler.  The
+        # legacy tables remain untouched so old deployments can be rolled back.
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS worker_sessions (
+                session_id TEXT PRIMARY KEY,
+                job_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                last_heartbeat REAL NOT NULL,
+                ended_at REAL,
+                status TEXT NOT NULL DEFAULT 'ACTIVE',
+                dps_submitted INTEGER NOT NULL DEFAULT 0,
+                hashrate_mhs REAL NOT NULL DEFAULT 0
+            )
+        ''')
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_job ON worker_sessions(job_id, status)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_sessions_worker ON worker_sessions(worker_id, status)")
+
+        global_dp_columns = {row[1] for row in cursor.execute("PRAGMA table_info(global_dps)").fetchall()}
+        if "job_id" not in global_dp_columns:
+            cursor.execute("ALTER TABLE global_dps ADD COLUMN job_id TEXT")
+        if "session_id" not in global_dp_columns:
+            cursor.execute("ALTER TABLE global_dps ADD COLUMN session_id TEXT")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_global_dps_job_x ON global_dps(job_id, x_prefix, dp_type)")
+
+        # Historical rows remain immutable and are matched through
+        # puzzle_number. New rows are scoped precisely by job_id.
+
         conn.commit()
 
         # WAL mode: múltiplos leitores simultâneos sem bloquear escritas
@@ -396,7 +428,7 @@ def _recover_abandoned_chunks():
             print(f"⚠️  Error in chunk recovery thread: {e}")
 
 _recovery_thread = threading.Thread(target=_recover_abandoned_chunks, daemon=True)
-_recovery_thread.start()
+# Legacy chunk recovery intentionally disabled in DP-first mode.
 
 # Pydantic Schemas
 class CreateJobRequest(BaseModel):
@@ -442,14 +474,26 @@ class SubmitSolutionRequest(BaseModel):
     private_key: str
 
 class DPItem(BaseModel):
-    x_prefix: str
-    dist_hex: str
-    dp_type: int = 0
+    x_prefix: str = Field(min_length=8, max_length=64, pattern=r"^[0-9a-fA-F]+$")
+    dist_hex: str = Field(min_length=1, max_length=80, pattern=r"^[0-9a-fA-F]+$")
+    dp_type: int = Field(ge=0, le=1)
 
 class DPBatchSubmit(BaseModel):
-    worker_name: str
+    worker_id: Optional[str] = Field(default=None, max_length=128)
+    worker_name: Optional[str] = Field(default=None, max_length=128)
+    session_id: Optional[str] = Field(default=None, max_length=128)
+    job_id: Optional[str] = Field(default=None, max_length=128)
     puzzle_number: int = 140
-    dps: List[DPItem]
+    dps: List[DPItem] = Field(min_length=1, max_length=500)
+
+class SessionRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    job_id: Optional[str] = Field(default=None, max_length=128)
+    hashrate_mhs: float = Field(default=0.0, ge=0.0)
+
+class EndSessionRequest(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    session_id: str = Field(min_length=1, max_length=128)
 
 # Preset Puzzles Dictionary (Dados Oficiais dos Desafios Bitcoin)
 # chunk_bits: tamanho de cada fatia de trabalho por puzzle
@@ -570,7 +614,7 @@ def create_job(req: CreateJobRequest, username: str = Depends(authenticate_dashb
     return {"status": "SUCCESS", "job_id": job_id}
 
 # ─── Endpoints do Banco Global de DPs ──────────────────────────────────────────
-@app.post("/api/dp/submit_batch")
+@app.post("/api/dp/submit_batch_legacy", include_in_schema=False)
 def submit_dp_batch(data: DPBatchSubmit, request: Request):
     verify_worker_token(request)
 
@@ -693,6 +737,92 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
     }
 
 
+@app.post("/api/dp/submit_batch")
+def submit_dp_batch_v2(data: DPBatchSubmit, request: Request):
+    verify_worker_token(request)
+    if not data.worker_id or not data.session_id or not data.job_id:
+        raise HTTPException(status_code=422, detail="worker_id, session_id e job_id sao obrigatorios")
+
+    now = time.time()
+    solved = False
+    ingested = 0
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        session = cursor.execute(
+            """SELECT s.worker_id, s.job_id, j.pubkey, j.start_hex
+               FROM worker_sessions s JOIN jobs j ON j.job_id=s.job_id
+               WHERE s.session_id=? AND s.worker_id=? AND s.job_id=?
+                 AND s.status='ACTIVE' AND j.status='ACTIVE'""",
+            (data.session_id, data.worker_id, data.job_id)
+        ).fetchone()
+        if not session:
+            conn.close()
+            raise HTTPException(status_code=409, detail="Sessao DP inativa ou incompativel")
+
+        worker = cursor.execute("SELECT name FROM workers WHERE worker_id=?", (data.worker_id,)).fetchone()
+        worker_name = worker[0] if worker else data.worker_id
+        target_pubkey = session["pubkey"]
+        start_offset = int(str(session["start_hex"] or "0").replace("0x", ""), 16)
+
+        for dp in data.dps:
+            x_value = dp.x_prefix.lower()
+            distance = dp.dist_hex.lower()
+            dp_type = int(dp.dp_type)
+            matches = cursor.execute(
+                """SELECT dist_hex FROM global_dps
+                   WHERE (job_id=? OR ((job_id IS NULL OR job_id='') AND puzzle_number=?))
+                     AND x_prefix=? AND dp_type!=? LIMIT 100""",
+                (data.job_id, data.puzzle_number, x_value, dp_type)
+            ).fetchall()
+            for match in matches:
+                difference = abs(int(match["dist_hex"], 16) - int(distance, 16))
+                candidates = {difference, difference // 2}
+                candidates.update(value + start_offset for value in tuple(candidates) if value)
+                for value in candidates:
+                    if value > 0 and verify_private_key(f"{value:064x}", target_pubkey):
+                        solved = True
+                        cursor.execute(
+                            "UPDATE jobs SET status='SOLVED', solved_at=?, solved_by=?, private_key=? WHERE job_id=?",
+                            (now, data.worker_id, f"{value:064x}", data.job_id)
+                        )
+                        log_event(f"Colisao DP valida no job {data.job_id}; resultado armazenado na VPS")
+                        break
+                if solved:
+                    break
+
+            duplicate = cursor.execute(
+                "SELECT 1 FROM global_dps WHERE job_id=? AND x_prefix=? AND dist_hex=? AND dp_type=? LIMIT 1",
+                (data.job_id, x_value, distance, dp_type)
+            ).fetchone()
+            if not duplicate:
+                cursor.execute(
+                    """INSERT INTO global_dps
+                       (puzzle_number, x_prefix, dist_hex, dp_type, worker_name, created_at, job_id, session_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (data.puzzle_number, x_value, distance, dp_type, worker_name, now, data.job_id, data.session_id)
+                )
+                ingested += 1
+
+        cursor.execute(
+            "UPDATE worker_sessions SET dps_submitted=dps_submitted+?, last_heartbeat=? WHERE session_id=?",
+            (ingested, now, data.session_id)
+        )
+        cursor.execute(
+            "UPDATE workers SET dps_count=dps_count+?, last_ping=? WHERE worker_id=?",
+            (ingested, now, data.worker_id)
+        )
+        total = cursor.execute(
+            """SELECT COUNT(*) FROM global_dps
+               WHERE job_id=? OR ((job_id IS NULL OR job_id='') AND puzzle_number=?)""",
+            (data.job_id, data.puzzle_number)
+        ).fetchone()[0]
+        conn.commit()
+        conn.close()
+
+    return {"status": "ok", "ingested": ingested, "total_global_dps": total, "solved": solved}
+
+
 @app.get("/api/dp/stats")
 def get_dp_stats():
     with db_lock:
@@ -738,6 +868,29 @@ def clear_jobs(username: str = Depends(authenticate_dashboard)):
     return {"status": "CLEARED"}
 
 def generate_coverage_report():
+    """Report DP contribution without claiming deterministic range coverage."""
+    with db_lock:
+        conn = get_db()
+        total_dps = conn.execute("SELECT COUNT(*) FROM global_dps").fetchone()[0]
+        sessions = conn.execute("SELECT COUNT(*) FROM worker_sessions").fetchone()[0]
+        active = conn.execute("SELECT COUNT(*) FROM worker_sessions WHERE status='ACTIVE'").fetchone()[0]
+        workers = conn.execute("SELECT COUNT(*) FROM workers WHERE (? - last_ping) < ?", (time.time(), WORKER_ALIVE_SECONDS)).fetchone()[0]
+        conn.close()
+    text = (
+        "RELATORIO DP-FIRST\n"
+        "=================\n"
+        f"DPs persistidos: {total_dps:,}\n"
+        f"Sessoes totais: {sessions:,}\n"
+        f"Sessoes ativas: {active:,}\n"
+        f"Workers ativos: {workers:,}\n\n"
+        "O metodo Kangaroo compartilha Distinguished Points e nao comprova "
+        "cobertura linear de percentuais do keyspace."
+    )
+    return {"text": text, "total_dps": total_dps, "sessions": sessions,
+            "active_sessions": active, "active_workers": workers,
+            "scanned_ranges": [], "free_gaps": []}
+
+    # Legacy coverage implementation retained below for rollback reference.
     with db_lock:
         conn = get_db()
         cursor = conn.cursor()
@@ -888,8 +1041,13 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
                     w_dict['current_start_hex'] = "0x80000000000000000000000000000000000"
                 w_dict['current_range_bits'] = "139"
 
-            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE (assigned_worker = ? OR assigned_worker LIKE ?) AND status IN ('COMPLETED', 'SOLVED')", (w_dict['worker_id'], f"{w_name}%"))
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM worker_sessions WHERE worker_id=? AND status='ENDED'",
+                (w_dict['worker_id'],)
+            )
+            # Keep the response key temporarily for the existing dashboard UI.
             w_dict['completed_chunks'] = cursor.fetchone()['cnt']
+            w_dict['completed_sessions'] = w_dict['completed_chunks']
             workers.append(w_dict)
             
         # Apenas ONLINE contribui para o hashrate total
@@ -908,11 +1066,12 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
             pub = j_dict.get('pubkey', '').lower()
             j_dict['btc_address'] = pubkey_to_address(pub)
             
-            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE job_id = ?", (j_dict['job_id'],))
+            cursor.execute("SELECT COUNT(*) as cnt FROM worker_sessions WHERE job_id = ?", (j_dict['job_id'],))
             j_dict['total_chunks_assigned'] = cursor.fetchone()['cnt']
-            
-            cursor.execute("SELECT COUNT(*) as cnt FROM chunks WHERE job_id = ? AND status IN ('COMPLETED', 'SOLVED')", (j_dict['job_id'],))
+            j_dict['total_sessions'] = j_dict['total_chunks_assigned']
+            cursor.execute("SELECT COUNT(*) as cnt FROM worker_sessions WHERE job_id = ? AND status='ENDED'", (j_dict['job_id'],))
             j_dict['completed_chunks'] = cursor.fetchone()['cnt']
+            j_dict['completed_sessions'] = j_dict['completed_chunks']
             
             if pub in pubkey_to_preset:
                 p_num, p_bits = pubkey_to_preset[pub]
@@ -978,7 +1137,7 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         expected_ops = 1.15 * (2 ** 69.5)
         prob_pct = (keys_tested_live / expected_ops) * 100.0 if expected_ops > 0 else 0.0
         if prob_pct > 100.0:
-            prob_pct_str = "100.0% (Faixa Concluída)"
+            prob_pct_str = "100.0% (estimativa estatistica)"
         elif prob_pct < 0.0001 and prob_pct > 0:
             prob_pct_str = f"{prob_pct:.6f}%"
         else:
@@ -1042,7 +1201,7 @@ def get_stats(username: str = Depends(authenticate_dashboard)):
         }
 
 # Open Worker Endpoints (Auto-Creates Job if No Active Job Exists)
-@app.post("/api/worker/ensure_job")
+@app.post("/api/worker/ensure_job_legacy", include_in_schema=False)
 def ensure_job(req: CreateJobRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
@@ -1142,8 +1301,9 @@ def heartbeat(req: WorkerHeartbeatRequest, _: None = Depends(verify_worker_token
             ''', (req.hashrate_mhs, now, req.worker_id))
             
         cursor.execute('''
-            UPDATE chunks SET last_heartbeat = ? WHERE assigned_worker = ? AND status = 'ASSIGNED'
-        ''', (now, req.worker_id))
+            UPDATE worker_sessions SET last_heartbeat = ?, hashrate_mhs = ?
+            WHERE worker_id = ? AND status = 'ACTIVE'
+        ''', (now, req.hashrate_mhs, req.worker_id))
 
         conn.commit()
         conn.close()
@@ -1151,7 +1311,7 @@ def heartbeat(req: WorkerHeartbeatRequest, _: None = Depends(verify_worker_token
         add_vps_log(f"💾 Progresso Salvo na VPS | Guerreiro: {req.worker_id} | Hashrate: {hr_str} ✅")
     return {"status": "OK"}
 
-@app.post("/api/worker/chunk_heartbeat")
+@app.post("/api/worker/chunk_heartbeat_legacy", include_in_schema=False)
 def chunk_heartbeat(req: ChunkHeartbeatRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
@@ -1176,7 +1336,65 @@ def chunk_heartbeat(req: ChunkHeartbeatRequest, _: None = Depends(verify_worker_
         add_vps_log(f"💾 Heartbeat & Progresso Salvos na VPS | Sub-bloco: {req.chunk_id} | Guerreiro: {req.worker_id} ({hr_str}) ✅")
     return {"status": "OK"}
 
-@app.post("/api/worker/get_work")
+@app.post("/api/worker/start_session")
+def start_session(req: SessionRequest, _: None = Depends(verify_worker_token)):
+    now = time.time()
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        worker = cursor.execute("SELECT worker_id FROM workers WHERE worker_id=?", (req.worker_id,)).fetchone()
+        if not worker:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Worker nao registrado")
+        if req.job_id:
+            job = cursor.execute("SELECT * FROM jobs WHERE job_id=? AND status='ACTIVE'", (req.job_id,)).fetchone()
+        else:
+            job = cursor.execute("SELECT * FROM jobs WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 1").fetchone()
+        if not job:
+            conn.close()
+            return {"status": "NO_WORK", "message": "Nenhum job DP ativo"}
+
+        cursor.execute(
+            "UPDATE worker_sessions SET status='ENDED', ended_at=? WHERE worker_id=? AND status='ACTIVE'",
+            (now, req.worker_id)
+        )
+        session_id = f"session_{int(now * 1000)}_{secrets.token_hex(4)}"
+        cursor.execute(
+            """INSERT INTO worker_sessions
+               (session_id, job_id, worker_id, started_at, last_heartbeat, status, hashrate_mhs)
+               VALUES (?, ?, ?, ?, ?, 'ACTIVE', ?)""",
+            (session_id, job["job_id"], req.worker_id, now, now, req.hashrate_mhs)
+        )
+        cursor.execute("UPDATE workers SET current_job_id=?, last_ping=? WHERE worker_id=?",
+                       (job["job_id"], now, req.worker_id))
+        conn.commit()
+        result = {
+            "status": "SESSION_STARTED", "session_id": session_id, "job_id": job["job_id"],
+            "pubkey": job["pubkey"], "start_hex": job["base_start_hex"],
+            "range_bits": job["range_bits"], "dp_bits": job["dp_bits"] or 24,
+            "max_ops": "1000.0"
+        }
+        conn.close()
+        return result
+
+
+@app.post("/api/worker/end_session")
+def end_session(req: EndSessionRequest, _: None = Depends(verify_worker_token)):
+    with db_lock:
+        conn = get_db()
+        cursor = conn.cursor()
+        cursor.execute(
+            """UPDATE worker_sessions SET status='ENDED', ended_at=?
+               WHERE session_id=? AND worker_id=? AND status='ACTIVE'""",
+            (time.time(), req.session_id, req.worker_id)
+        )
+        updated = cursor.rowcount
+        conn.commit()
+        conn.close()
+    return {"status": "OK", "ended": updated > 0}
+
+
+@app.post("/api/worker/get_work_legacy", include_in_schema=False)
 def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
     with db_lock:
         conn = get_db()
@@ -1377,7 +1595,7 @@ def get_work(req: WorkRequest, _: None = Depends(verify_worker_token)):
             "max_ops": str(max_ops_dynamic)
         }
 
-@app.post("/api/worker/complete_chunk")
+@app.post("/api/worker/complete_chunk_legacy", include_in_schema=False)
 def complete_chunk(req: CompleteChunkRequest, _: None = Depends(verify_worker_token)):
     """Worker chama este endpoint quando termina um chunk com sucesso (sem encontrar a chave).
     Só então o chunk é marcado como COMPLETED — elimina falsos positivos.
@@ -1423,19 +1641,13 @@ def submit_solution(req: SubmitSolutionRequest, _: None = Depends(verify_worker_
         
         cursor.execute('''
             UPDATE jobs SET status = 'SOLVED', solved_at = ?, solved_by = ?, private_key = ?
-            WHERE pubkey = ? OR job_id = (SELECT job_id FROM chunks WHERE chunk_id = ?)
-        ''', (now, req.worker_id, req.private_key, req.pubkey.lower(), req.chunk_id))
-        
-        cursor.execute("UPDATE chunks SET status = 'SOLVED' WHERE chunk_id = ?", (req.chunk_id,))
-        results_file = os.path.join(os.path.dirname(__file__), "POOL_RESULTS.TXT")
-        wif_key = hex_to_wif(req.private_key, compressed=True)
-        with open(results_file, "a") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] PUBKEY: {req.pubkey} | PRIVATE KEY HEX: {req.private_key} | WIF: {wif_key} | SOLVED BY: {req.worker_id}\n")
+            WHERE LOWER(pubkey) = ? AND status = 'ACTIVE'
+        ''', (now, req.worker_id, req.private_key, req.pubkey.lower()))
 
         conn.commit()
         conn.close()
 
-    print(f"🎉 SOLVED! Worker {req.worker_id} found private key: {req.private_key} (WIF: {wif_key})")
+    print(f"Verified solution recorded securely for worker {req.worker_id}")
     return {"status": "ACCEPTED", "message": "Solution recorded!"}
 
 # HTML Dashboard Route

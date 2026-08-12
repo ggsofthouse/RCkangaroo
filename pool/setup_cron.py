@@ -33,6 +33,21 @@ print("=== CRONTAB ATUAL ===")
 crontab -l
 """
 
-stdin, stdout, stderr = ssh.exec_command('chmod +x /opt/rckangaroo/pool/server/backup_pool.sh && /opt/rckangaroo/pool/server/backup_pool.sh && (crontab -l 2>/dev/null | grep -v backup_pool.sh; echo "*/30 * * * * /opt/rckangaroo/pool/server/backup_pool.sh >> /var/log/pool_backup.log 2>&1") | crontab - && crontab -l')
+command = r'''chmod +x /opt/rckangaroo/pool/server/backup_pool.sh && \
+/opt/rckangaroo/pool/server/backup_pool.sh && \
+python3 -c "import sqlite3; c=sqlite3.connect('/opt/rckangaroo/pool/server/backups/pool_latest.db'); print(c.execute('PRAGMA integrity_check').fetchone()[0])" | grep -qx ok && \
+(crontab -l 2>/dev/null | grep -v backup_pool.sh; echo "*/30 * * * * /opt/rckangaroo/pool/server/backup_pool.sh >> /var/log/pool_backup.log 2>&1") | crontab - && \
+crontab -l && df -h / && du -sh /opt/rckangaroo/pool/server/backups'''
+if "--cleanup-old" in sys.argv:
+    command += r''' && \
+find /opt/rckangaroo/pool/server/backups -maxdepth 1 -type f \( -name 'pool_*.db' -o -name 'pool_*.db-wal' \) ! -name 'pool_latest.db' -delete && \
+find /opt/rckangaroo/backups -mindepth 2 -maxdepth 2 -type f -path '*/deploy_*/pool.db' -delete && \
+python3 -c "import sqlite3; c=sqlite3.connect('/opt/rckangaroo/pool/server/backups/pool_latest.db'); print(c.execute('PRAGMA integrity_check').fetchone()[0])" | grep -qx ok && \
+echo '--- APOS LIMPEZA ---' && df -h / && du -sh /opt/rckangaroo/pool/server/backups /opt/rckangaroo/backups && \
+find /opt/rckangaroo/pool/server/backups -maxdepth 1 -type f -printf '%f %s bytes\n' | sort'''
+stdin, stdout, stderr = ssh.exec_command(command)
 print(stdout.read().decode('utf-8', errors='replace'))
+errors = stderr.read().decode('utf-8', errors='replace')
+if errors:
+    print(errors)
 ssh.close()

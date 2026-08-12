@@ -29,6 +29,7 @@ Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 dp_batch_queue = queue.Queue()
 DP_REQUEUE_CAP = 20000
 SUPPORTS_STREAM_DPS = True
+CURRENT_DP_CONTEXT = {"session_id": None, "job_id": None}
 
 def dp_flusher_loop(worker_name: str, puzzle_number: int):
     """Background thread that batches DP entries and posts to /api/dp/submit_batch on pool server."""
@@ -42,8 +43,17 @@ def dp_flusher_loop(worker_name: str, puzzle_number: int):
                 except queue.Empty:
                     break
             if batch:
+                session_id = CURRENT_DP_CONTEXT.get("session_id")
+                job_id = CURRENT_DP_CONTEXT.get("job_id")
+                if not session_id or not job_id:
+                    for item in batch:
+                        dp_batch_queue.put(item)
+                    time.sleep(1.0)
+                    continue
                 res = http_post("/api/dp/submit_batch", {
-                    "worker_name": worker_name,
+                    "worker_id": WORKER_ID,
+                    "session_id": session_id,
+                    "job_id": job_id,
                     "puzzle_number": puzzle_number,
                     "dps": batch
                 })
@@ -51,7 +61,7 @@ def dp_flusher_loop(worker_name: str, puzzle_number: int):
                 # Check if submission was successfully ingested by VPS
                 if res and res.get("status") == "ok":
                     if res.get("solved"):
-                        print(f"\n🎉 CHAVE ENCONTRADA VIA COLISÃO GLOBAL DE DP! Chave: {res.get('private_key')}")
+                        print("\nSolucao encontrada por colisao global de DP e armazenada com seguranca na VPS.")
                 else:
                     # Connection/submission failed — re-queue DPs to prevent data loss
                     if dp_batch_queue.qsize() < DP_REQUEUE_CAP:
@@ -359,11 +369,7 @@ def main():
     })
 
     # Ensure target puzzle job matches requested choice on pool server
-    http_post("/api/worker/ensure_job", {
-        "puzzle_number": TARGET_PUZZLE,
-        "start_percent": START_PCT,
-        "end_percent": END_PCT
-    })
+    # Jobs are created by the dashboard/admin. Workers only start DP sessions.
 
     # Start background DP flusher thread for cloud streaming
     flusher_thread = threading.Thread(target=dp_flusher_loop, args=(WORKER_NAME, TARGET_PUZZLE), daemon=True)
@@ -372,24 +378,20 @@ def main():
     while True:
         try:
             # Request work job
-            work = http_post("/api/worker/get_work", {
+            work = http_post("/api/worker/start_session", {
                 "worker_id": WORKER_ID,
-                "name": WORKER_NAME,
                 "hashrate_mhs": last_known_mhs
             })
             
             if not work or work.get("status") == "NO_WORK":
                 print(f"⚙️ Ativando Puzzle #{TARGET_PUZZLE} ({START_PCT}% -> {END_PCT}%) no servidor...")
-                http_post("/api/worker/ensure_job", {
-                    "puzzle_number": TARGET_PUZZLE,
-                    "start_percent": START_PCT,
-                    "end_percent": END_PCT
-                })
-                time.sleep(2)
+                time.sleep(10)
                 continue
 
-            if work.get("status") == "WORK_ASSIGNED":
-                chunk_id = work.get("chunk_id", "job_140")
+            if work.get("status") == "SESSION_STARTED":
+                session_id = work["session_id"]
+                CURRENT_DP_CONTEXT["session_id"] = session_id
+                CURRENT_DP_CONTEXT["job_id"] = work["job_id"]
                 pubkey = work["pubkey"]
                 start_hex = work["start_hex"]
                 range_bits = work["range_bits"]
@@ -550,7 +552,7 @@ def main():
                     print(f"\n🌟 REAL CHAVE PRIVADA VERIFICADA MATEMATICAMENTE: {found_key}! Enviando ao servidor...")
                     http_post("/api/worker/submit_solution", {
                         "worker_id": WORKER_ID,
-                        "chunk_id": chunk_id,
+                        "chunk_id": session_id,
                         "pubkey": pubkey,
                         "private_key": found_key
                     })
@@ -558,10 +560,12 @@ def main():
                     break
 
                 # Confirma atualização de progresso contínuo ao servidor
-                http_post("/api/worker/complete_chunk", {
+                http_post("/api/worker/end_session", {
                     "worker_id": WORKER_ID,
-                    "chunk_id": chunk_id
+                    "session_id": session_id
                 })
+                CURRENT_DP_CONTEXT["session_id"] = None
+                CURRENT_DP_CONTEXT["job_id"] = None
                 print("✅ Sessão de busca em andamento. Renovando conexão...\n")
 
         except KeyboardInterrupt:
