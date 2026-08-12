@@ -63,6 +63,59 @@ Sample command line for puzzle #85:
 
 RCKangaroo.exe -dp 16 -range 84 -start 1000000000000000000000 -pubkey 0329c4574a4fd8c810b7e42a4b398882b381bcd85e40c6883712912d167c83e73a
 
+<b>RTX 5090 and cluster validation:</b>
+
+Build native Blackwell code on a CUDA 12.8+ / 13.x Linux host:
+
+```
+git clone https://github.com/ggsofthouse/RCkangaroo.git /workspace/RCkangaroo
+cd /workspace/RCkangaroo
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel "$(nproc)"
+```
+
+Fixed-time range-139 benchmark on GPU 0 using the measured RTX 5090 setting:
+
+```
+python3 tune_gpu.py --binary ./build/bin/rckangaroo --seconds 30 \
+  --range 139 --dp 20 --gpu 0 --inv-sm 10 --csv tune_5090.csv
+```
+
+Benchmark every GPU in one host, or solve the known Puzzle #100 test reduced by
+20 bits with all GPUs in that host:
+
+```
+chmod +x cluster/cluster_5090_node.sh
+cluster/cluster_5090_node.sh benchmark 30 139 20 10
+cluster/cluster_5090_node.sh p100-residue20 30 139 20 10
+```
+
+Dispatch the benchmark concurrently to several SSH-accessible Vast hosts from
+Windows (copy and fill `cluster/cluster_hosts.example.csv` first):
+
+```
+.\cluster\dispatch_cluster_5090.ps1 `
+  -HostsCsv .\cluster_hosts.csv `
+  -KeyPath C:\Users\you\.ssh\vast_cluster_ed25519 `
+  -Mode benchmark -Seconds 30 -InvSm 10
+```
+
+Generate an exact reduced ECDLP when a candidate residue `k mod 2^b` is known:
+
+```
+python3 residue_reduction.py --pubkey <compressed-pubkey> \
+  --start <hex-start> --range <width-bits> --residue-bits <b> \
+  --residues <candidate> --binary ./build/bin/rckangaroo \
+  --gpu 0123 --dp 20 --csv residue_jobs.csv
+```
+
+The residue transform removes exactly `b` bits only when the correct residue is
+in the candidate set. Exhaustively trying all `2^b` residues is worse than the
+original Kangaroo search. Likewise, summing benchmark throughput is linear, but
+splitting one interval into `m` independent subranges provides only about
+`sqrt(m)` algorithmic wall-clock speedup. See `cluster/README.md` for the full
+multi-host workflow and safety notes.
+
 Sample command to generate tames:
 
 RCKangaroo.exe -dp 16 -range 76 -tames tames76.dat -max 10
