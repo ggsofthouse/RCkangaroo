@@ -462,12 +462,15 @@ def main():
                                     sys.stdout.write("⚠️ Binário local não possui suporte a -stream-dps. Desativando opção no worker...\n")
                                     sys.stdout.flush()
                                 if line_str.startswith("DP_ENTRY:"):
-                                    parts = line_str.split(":")
-                                    if len(parts) >= 4:
+                                    dp_match = re.fullmatch(
+                                        r"DP_ENTRY:([01]):([0-9a-fA-F]{24}):([0-9a-fA-F]{44})",
+                                        line_str,
+                                    )
+                                    if dp_match:
                                         try:
-                                            dp_type = int(parts[1])
-                                            x_prefix = parts[2]
-                                            dist_hex = parts[3]
+                                            dp_type = int(dp_match.group(1))
+                                            x_prefix = dp_match.group(2)
+                                            dist_hex = dp_match.group(3)
                                             dp_batch_queue.put({
                                                 "x_prefix": x_prefix,
                                                 "dist_hex": dist_hex,
