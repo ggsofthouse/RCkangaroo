@@ -15,6 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
+from collision_sota import final_private_key_candidates
 
 app = FastAPI(title="RCKangaroo Distributed Pool Coordinator", version="6.1")
 
@@ -92,7 +93,7 @@ def log_event(msg: str):
     server_logs.append(formatted)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_DIR, "pool.db")
+DB_FILE = os.environ.get("POOL_DB_FILE", os.path.join(BASE_DIR, "pool.db"))
 db_lock = threading.RLock()
 security = HTTPBasic()
 
@@ -305,7 +306,8 @@ def init_db():
         columns_to_add = [
             ("start_percent", "REAL DEFAULT 0.0"),
             ("end_percent", "REAL DEFAULT 100.0"),
-            ("base_start_hex", "TEXT DEFAULT '0'")
+            ("base_start_hex", "TEXT DEFAULT '0'"),
+            ("dp_count", "INTEGER DEFAULT 0")
         ]
         for col_name, col_type in columns_to_add:
             try:
@@ -639,11 +641,12 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
         cursor = conn.cursor()
 
         job_row = cursor.execute(
-            "SELECT pubkey, job_id, start_hex FROM jobs WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 1"
+            "SELECT pubkey, job_id, start_hex, range_bits FROM jobs WHERE status='ACTIVE' ORDER BY created_at DESC LIMIT 1"
         ).fetchone()
         target_pubkey = job_row["pubkey"] if job_row else None
         job_id = job_row["job_id"] if job_row else None
         start_hex_val = job_row["start_hex"] if (job_row and "start_hex" in job_row.keys()) else "0"
+        range_bits_val = int(job_row["range_bits"]) if job_row else data.puzzle_number
 
         db_records = []
         for dp in data.dps:
@@ -653,17 +656,12 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
 
             # Busca colisão diretamente no SQLite (índice idx_global_dps_x garante velocidade)
             existing_rows = cursor.execute(
-                "SELECT dist_hex, dp_type FROM global_dps WHERE puzzle_number = ? AND x_prefix = ? AND dp_type != ?",
-                (data.puzzle_number, x_clean, dp_type)
+                "SELECT dist_hex, dp_type FROM global_dps WHERE puzzle_number = ? AND x_prefix = ?",
+                (data.puzzle_number, x_clean)
             ).fetchall()
 
             for existing in existing_rows:
                 try:
-                    dist1 = int(str(existing["dist_hex"]).lower(), 16)
-                    dist2 = int(d_clean, 16)
-                    diff_direct = abs(dist1 - dist2)
-                    diff_half = diff_direct // 2
-
                     start_offset = 0
                     if start_hex_val:
                         try:
@@ -671,17 +669,10 @@ def submit_dp_batch(data: DPBatchSubmit, request: Request):
                         except Exception:
                             start_offset = 0
 
-                    cand_ints = set()
-                    for diff in [diff_direct, diff_half]:
-                        if diff == 0:
-                            continue
-                        cand_ints.add(diff)
-                        if start_offset > 0:
-                            cand_ints.add(diff + start_offset)
-                            if diff > start_offset:
-                                cand_ints.add(diff - start_offset)
-                            else:
-                                cand_ints.add(start_offset - diff)
+                    cand_ints = final_private_key_candidates(
+                        str(existing["dist_hex"]), int(existing["dp_type"]),
+                        d_clean, dp_type, start_offset, range_bits_val,
+                    )
 
                     if target_pubkey:
                         for c_val in cand_ints:
@@ -750,7 +741,7 @@ def submit_dp_batch_v2(data: DPBatchSubmit, request: Request):
         conn = get_db()
         cursor = conn.cursor()
         session = cursor.execute(
-            """SELECT s.worker_id, s.job_id, j.pubkey, j.start_hex
+            """SELECT s.worker_id, s.job_id, j.pubkey, j.start_hex, j.range_bits
                FROM worker_sessions s JOIN jobs j ON j.job_id=s.job_id
                WHERE s.session_id=? AND s.worker_id=? AND s.job_id=?
                  AND s.status='ACTIVE' AND j.status='ACTIVE'""",
@@ -765,20 +756,33 @@ def submit_dp_batch_v2(data: DPBatchSubmit, request: Request):
         target_pubkey = session["pubkey"]
         start_offset = int(str(session["start_hex"] or "0").replace("0x", ""), 16)
 
+        # Resolve all x-prefixes in one indexed query.  The old implementation
+        # issued two SELECTs per DP, serializing the entire GPU fleet on SQLite.
+        x_values = list(dict.fromkeys(dp.x_prefix.lower() for dp in data.dps))
+        placeholders = ",".join("?" for _ in x_values)
+        existing_rows = cursor.execute(
+            f"""SELECT x_prefix, dist_hex, dp_type FROM global_dps
+                WHERE (job_id=? OR ((job_id IS NULL OR job_id='') AND puzzle_number=?))
+                  AND x_prefix IN ({placeholders})""",
+            (data.job_id, data.puzzle_number, *x_values),
+        ).fetchall()
+        matches_by_x = {}
+        known_records = set()
+        for row in existing_rows:
+            record = (row["dist_hex"], int(row["dp_type"]))
+            matches_by_x.setdefault(row["x_prefix"], []).append(record)
+            known_records.add((row["x_prefix"], *record))
+
+        db_records = []
         for dp in data.dps:
             x_value = dp.x_prefix.lower()
             distance = dp.dist_hex.lower()
             dp_type = int(dp.dp_type)
-            matches = cursor.execute(
-                """SELECT dist_hex FROM global_dps
-                   WHERE (job_id=? OR ((job_id IS NULL OR job_id='') AND puzzle_number=?))
-                     AND x_prefix=? AND dp_type!=? LIMIT 100""",
-                (data.job_id, data.puzzle_number, x_value, dp_type)
-            ).fetchall()
-            for match in matches:
-                difference = abs(int(match["dist_hex"], 16) - int(distance, 16))
-                candidates = {difference, difference // 2}
-                candidates.update(value + start_offset for value in tuple(candidates) if value)
+            for match_distance, match_type in matches_by_x.get(x_value, ()):
+                candidates = final_private_key_candidates(
+                    match_distance, match_type,
+                    distance, dp_type, start_offset, int(session["range_bits"]),
+                )
                 for value in candidates:
                     if value > 0 and verify_private_key(f"{value:064x}", target_pubkey):
                         solved = True
@@ -791,18 +795,23 @@ def submit_dp_batch_v2(data: DPBatchSubmit, request: Request):
                 if solved:
                     break
 
-            duplicate = cursor.execute(
-                "SELECT 1 FROM global_dps WHERE job_id=? AND x_prefix=? AND dist_hex=? AND dp_type=? LIMIT 1",
-                (data.job_id, x_value, distance, dp_type)
-            ).fetchone()
-            if not duplicate:
-                cursor.execute(
-                    """INSERT INTO global_dps
-                       (puzzle_number, x_prefix, dist_hex, dp_type, worker_name, created_at, job_id, session_id)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (data.puzzle_number, x_value, distance, dp_type, worker_name, now, data.job_id, data.session_id)
+            record_key = (x_value, distance, dp_type)
+            if record_key not in known_records:
+                known_records.add(record_key)
+                matches_by_x.setdefault(x_value, []).append((distance, dp_type))
+                db_records.append(
+                    (data.puzzle_number, x_value, distance, dp_type, worker_name,
+                     now, data.job_id, data.session_id)
                 )
                 ingested += 1
+
+        if db_records:
+            cursor.executemany(
+                """INSERT INTO global_dps
+                   (puzzle_number, x_prefix, dist_hex, dp_type, worker_name, created_at, job_id, session_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                db_records,
+            )
 
         cursor.execute(
             "UPDATE worker_sessions SET dps_submitted=dps_submitted+?, last_heartbeat=? WHERE session_id=?",
@@ -812,10 +821,12 @@ def submit_dp_batch_v2(data: DPBatchSubmit, request: Request):
             "UPDATE workers SET dps_count=dps_count+?, last_ping=? WHERE worker_id=?",
             (ingested, now, data.worker_id)
         )
+        cursor.execute(
+            "UPDATE jobs SET dp_count=COALESCE(dp_count,0)+? WHERE job_id=?",
+            (ingested, data.job_id),
+        )
         total = cursor.execute(
-            """SELECT COUNT(*) FROM global_dps
-               WHERE job_id=? OR ((job_id IS NULL OR job_id='') AND puzzle_number=?)""",
-            (data.job_id, data.puzzle_number)
+            "SELECT COALESCE(dp_count,0) FROM jobs WHERE job_id=?", (data.job_id,)
         ).fetchone()[0]
         conn.commit()
         conn.close()
@@ -1370,7 +1381,7 @@ def start_session(req: SessionRequest, _: None = Depends(verify_worker_token)):
         conn.commit()
         result = {
             "status": "SESSION_STARTED", "session_id": session_id, "job_id": job["job_id"],
-            "pubkey": job["pubkey"], "start_hex": job["base_start_hex"],
+            "pubkey": job["pubkey"], "start_hex": job["start_hex"],
             "range_bits": job["range_bits"], "dp_bits": job["dp_bits"] or 24,
             "max_ops": "1000.0"
         }

@@ -2,6 +2,8 @@
 
 Guia completo para rodar a Pool de processamento distribuído do **RCKangaroo** em sua máquina local (NVIDIA RTX 2060 Super), conectar máquinas Windows/Linux remotas e alugar GPUs na **Vast.ai** ou **RunPod**.
 
+> Antes de implantar GPUs, leia [POOL_CORRECTNESS_AUDIT.md](POOL_CORRECTNESS_AUDIT.md).
+
 ---
 
 ## 📐 Arquitetura da Pool
